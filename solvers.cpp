@@ -309,136 +309,6 @@ static void update_solution_residual_and_apply_diagonal(sycl::queue& q,
     });
 }
 
-static void apply_ic0_preconditioner_host_serial(const IC0Preconditioner& ic0,
-                                                 const std::vector<double>& b,
-                                                 std::vector<double>& y,
-                                                 std::vector<double>& x)
-{
-    const size_t n = b.size();
-    if (y.size() != n) {
-        y.resize(n);
-    }
-    if (x.size() != n) {
-        x.resize(n);
-    }
-
-    for (size_t row = 0; row < n; ++row) {
-        const size_t diag_index = ic0.diag_pos[row];
-        double sum = b[row];
-
-        for (size_t k = ic0.row_ptr[row]; k < diag_index; ++k) {
-            sum -= ic0.L_vals[k] * y[ic0.col_idx[k]];
-        }
-
-        y[row] = std::isfinite(sum) ? sum : 0.0;
-    }
-
-    for (size_t row = n; row-- > 0;) {
-        double diag_value = ic0.diag[row];
-        if (!std::isfinite(diag_value) || std::abs(diag_value) < 1e-14) {
-            diag_value = 1e-14;
-        }
-
-        double sum = y[row] / diag_value;
-        for (size_t ptr = ic0.upper_ptr[row]; ptr < ic0.upper_ptr[row + 1]; ++ptr) {
-            sum -= ic0.L_vals[ic0.upper_pos[ptr]] * x[ic0.upper_row_idx[ptr]];
-        }
-
-        x[row] = std::isfinite(sum) ? sum : 0.0;
-    }
-}
-
-static void apply_ic0_preconditioner_host_adaptive(const IC0Preconditioner& ic0,
-                                                   const std::vector<double>& b,
-                                                   std::vector<double>& y,
-                                                   std::vector<double>& x)
-{
-    const size_t n = b.size();
-    const size_t forward_levels =
-        ic0.forward_level_ptr.empty() ? 0 : ic0.forward_level_ptr.size() - 1;
-    const size_t backward_levels =
-        ic0.backward_level_ptr.empty() ? 0 : ic0.backward_level_ptr.size() - 1;
-    const size_t avg_forward_width =
-        (forward_levels > 0) ? (n + forward_levels - 1) / forward_levels : n;
-    const size_t avg_backward_width =
-        (backward_levels > 0) ? (n + backward_levels - 1) / backward_levels : n;
-
-    // For very narrow level schedules thread orchestration dominates on CPU.
-    const bool prefer_serial =
-        (forward_levels > 0 && backward_levels > 0) &&
-        (avg_forward_width < 64 || avg_backward_width < 64);
-
-    if (prefer_serial) {
-        apply_ic0_preconditioner_host_serial(ic0, b, y, x);
-        return;
-    }
-
-    applyIC0_preconditioner_host(ic0, b, y, x);
-}
-
-static unsigned int CG_IC0_host(const std::vector<size_t>& row_ptr,
-                                const std::vector<size_t>& col_ind,
-                                const std::vector<double>& val,
-                                const IC0Preconditioner& ic0,
-                                std::vector<double>& x,
-                                const std::vector<double>& b)
-{
-    const double b_norm = scalar_product_host(b, b);
-    if (b_norm < 1e-10) {
-        std::fill(x.begin(), x.end(), 0.0);
-        return 0;
-    }
-
-    const size_t n = b.size();
-    std::vector<double> r = b;
-    std::vector<double> y(n, 0.0);
-    std::vector<double> z(n, 0.0);
-    std::vector<double> p(n, 0.0);
-    std::vector<double> Ap(n, 0.0);
-
-    apply_ic0_preconditioner_host_adaptive(ic0, r, y, z);
-    double old_rr = scalar_product_host(r, z);
-    if (!std::isfinite(old_rr) || old_rr < 0.0) {
-        throw std::runtime_error("IC0 produced invalid initial residual: " + std::to_string(old_rr));
-    }
-
-    p = z;
-
-    unsigned int iteration = 0;
-    const unsigned int max_iter = static_cast<unsigned int>(n);
-
-    do {
-        ++iteration;
-
-        csr_mat_vec_prod_host(row_ptr, col_ind, val, p, Ap);
-        const double pAp = scalar_product_host(p, Ap);
-        const double alpha = (std::abs(pAp) > 1e-30) ? old_rr / pAp : 0.0;
-
-        parallel_for_host(0, n, 16384, [&](size_t i) {
-            x[i] += alpha * p[i];
-            r[i] -= alpha * Ap[i];
-        });
-
-        apply_ic0_preconditioner_host_adaptive(ic0, r, y, z);
-        const double new_rr = scalar_product_host(r, z);
-        if (!std::isfinite(new_rr)) {
-            throw std::runtime_error("IC0 produced invalid residual during iteration: " + std::to_string(new_rr));
-        }
-
-        if (new_rr / b_norm < eps * eps || iteration == max_iter) {
-            break;
-        }
-
-        const double beta = (std::abs(old_rr) > 1e-30) ? new_rr / old_rr : 0.0;
-        parallel_for_host(0, n, 16384, [&](size_t i) {
-            p[i] = z[i] + beta * p[i];
-        });
-        old_rr = new_rr;
-    } while (iteration < max_iter);
-
-    std::cout << "CG-IC iterations: " << iteration << std::endl;
-    return iteration;
-}
 
 unsigned int CG_SYCL_plain(CSR_matrix<double>& mat,
                            std::vector<double>& x,
@@ -703,6 +573,81 @@ unsigned int CG_SYCL_jacobi(CSR_matrix<double>& mat,
     return iteration;
 }
 
+// =====================================================================
+// IC0-preconditioned CG -- new optimised implementation.
+//
+// Two paths:
+//  * GPU SYCL queue: bulk Jacobi-sweep apply (preconditioner.cpp::
+//    applyIC0_preconditioner_jacobi_device), all CG scalars stay on the
+//    device, only new_rr is fetched per iteration to drive the
+//    convergence test, and the final x is copied once at the end.
+//  * CPU SYCL queue: bypass SYCL entirely. CG body runs on the host
+//    with the same parallel helpers as the rest of the project, and
+//    apply uses applyIC0_preconditioner_host (Jacobi by default, env
+//    IC0_JACOBI_SWEEPS=0 falls back to exact level-scheduled).
+// =====================================================================
+
+static unsigned int CG_IC0_host(const std::vector<size_t>& row_ptr,
+                                const std::vector<size_t>& col_ind,
+                                const std::vector<double>& val,
+                                const IC0Preconditioner& ic0,
+                                std::vector<double>& x,
+                                const std::vector<double>& b)
+{
+    const double b_norm = scalar_product_host(b, b);
+    if (b_norm < 1e-10) {
+        std::fill(x.begin(), x.end(), 0.0);
+        return 0;
+    }
+
+    const size_t n = b.size();
+    std::vector<double> r = b;
+    std::vector<double> y(n, 0.0);
+    std::vector<double> z(n, 0.0);
+    std::vector<double> p(n, 0.0);
+    std::vector<double> Ap(n, 0.0);
+
+    applyIC0_preconditioner_host(ic0, r, y, z);
+    double old_rr = scalar_product_host(r, z);
+    if (!std::isfinite(old_rr) || old_rr < 0.0) {
+        throw std::runtime_error("IC0 produced invalid initial residual: "
+                                 + std::to_string(old_rr));
+    }
+
+    p = z;
+
+    unsigned int iteration = 0;
+    const unsigned int max_iter = static_cast<unsigned int>(n);
+    do {
+        ++iteration;
+        csr_mat_vec_prod_host(row_ptr, col_ind, val, p, Ap);
+        const double pAp   = scalar_product_host(p, Ap);
+        const double alpha = (std::abs(pAp) > 1e-30) ? old_rr / pAp : 0.0;
+
+        parallel_for_host(0, n, 16384, [&](size_t i) {
+            x[i] += alpha * p[i];
+            r[i] -= alpha * Ap[i];
+        });
+
+        applyIC0_preconditioner_host(ic0, r, y, z);
+        const double new_rr = scalar_product_host(r, z);
+        if (!std::isfinite(new_rr)) {
+            throw std::runtime_error("IC0 produced invalid residual during iteration: "
+                                     + std::to_string(new_rr));
+        }
+        if (new_rr / b_norm < eps * eps || iteration == max_iter) break;
+
+        const double beta = (std::abs(old_rr) > 1e-30) ? new_rr / old_rr : 0.0;
+        parallel_for_host(0, n, 16384, [&](size_t i) {
+            p[i] = z[i] + beta * p[i];
+        });
+        old_rr = new_rr;
+    } while (iteration < max_iter);
+
+    std::cout << "CG-IC iterations: " << iteration << std::endl;
+    return iteration;
+}
+
 unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
                          std::vector<double>& x,
                          std::vector<double>& b,
@@ -713,7 +658,6 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
     auto& val = mat.val_ref();
     const size_t n = row_ptr.size() - 1;
     IC0Preconditioner ic0;
-
     ic0_factor(n, row_ptr, col_ind, val, ic0);
     return CG_SYCL_IC0(mat, x, b, q, ic0);
 }
@@ -724,21 +668,26 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
                          sycl::queue& q,
                          const IC0Preconditioner& ic0)
 {
-    double b_norm = scalar_product(b, b);
+    auto& row_ptr = mat.row_ptr_ref();
+    auto& col_ind = mat.col_ind_ref();
+    auto& val     = mat.val_ref();
+    const size_t n = row_ptr.size() - 1;
+
+    if (q.get_device().is_cpu()) {
+        return CG_IC0_host(row_ptr, col_ind, val, ic0, x, b);
+    }
+
+    const double b_norm = scalar_product(b, b);
     if (b_norm < 1e-10) {
         std::fill(x.begin(), x.end(), 0.0);
         return 0;
     }
 
-    auto& row_ptr = mat.row_ptr_ref();
-    auto& col_ind = mat.col_ind_ref();
-    auto& val = mat.val_ref();
-    const size_t n = row_ptr.size() - 1;
-    std::vector<double> r = b;
-    std::vector<double> Ap(n), z(n), p(n);
-
-    if (q.get_device().is_cpu()) {
-        return CG_IC0_host(row_ptr, col_ind, val, ic0, x, b);
+    int jacobi_sweeps = 2;
+    if (const char* env = std::getenv("IC0_JACOBI_SWEEPS")) {
+        const int v = std::atoi(env);
+        if (v >= 1 && v <= 10) jacobi_sweeps = v;
+        else if (v == 0)       jacobi_sweeps = 1; // exact not implemented on GPU
     }
 
     for (size_t idx = 0; idx < ic0.L_vals.size(); ++idx) {
@@ -747,157 +696,168 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
             while (bad_row + 1 < row_ptr.size() && row_ptr[bad_row + 1] <= idx) {
                 ++bad_row;
             }
-            throw std::runtime_error("IC0 factor contains NaN/Inf at row " + std::to_string(bad_row)
-                + ", col " + std::to_string(col_ind[idx]));
+            throw std::runtime_error("IC0 factor contains NaN/Inf at row "
+                                     + std::to_string(bad_row)
+                                     + ", col " + std::to_string(col_ind[idx]));
         }
     }
 
-    sycl::buffer<double> r_buf{r.data(), sycl::range<1>(n)};
-    sycl::buffer<double> z_buf{z.data(), sycl::range<1>(n)};
-    sycl::buffer<double> p_buf{p.data(), sycl::range<1>(n)};
-    sycl::buffer<double> x_buf{x.data(), sycl::range<1>(n)};
+    std::vector<double> r = b;
+    std::vector<double> Ap(n, 0.0);
+    std::vector<double> z(n, 0.0);
+    std::vector<double> p(n, 0.0);
+    std::vector<double> y_temp(n, 0.0);
+    std::vector<double> y2_temp(n, 0.0);
+
+    sycl::buffer<double> r_buf{r.data(),  sycl::range<1>(n)};
     sycl::buffer<double> Ap_buf{Ap.data(), sycl::range<1>(n)};
-    sycl::buffer<size_t> row_ptr_buf{row_ptr.data(), sycl::range<1>(row_ptr.size())};
-    sycl::buffer<size_t> col_ind_buf{col_ind.data(), sycl::range<1>(col_ind.size())};
-    sycl::buffer<double> val_buf{val.data(), sycl::range<1>(val.size())};
+    sycl::buffer<double> z_buf{z.data(),  sycl::range<1>(n)};
+    sycl::buffer<double> p_buf{p.data(),  sycl::range<1>(n)};
+    sycl::buffer<double> x_buf{x.data(),  sycl::range<1>(n)};
+    sycl::buffer<double> y_buf{y_temp.data(),  sycl::range<1>(n)};
+    sycl::buffer<double> y2_buf{y2_temp.data(), sycl::range<1>(n)};
 
-    double old_rr = 0.0, new_rr = 0.0, pAp = 0.0, alpha = 0.0, beta = 0.0;
-
-    sycl::buffer<double> old_rr_buf{&old_rr, sycl::range<1>(1)};
-    sycl::buffer<double> new_rr_buf{&new_rr, sycl::range<1>(1)};
-    sycl::buffer<double> pAp_buf{&pAp, sycl::range<1>(1)};
-    sycl::buffer<double> alpha_buf{&alpha, sycl::range<1>(1)};
-    sycl::buffer<double> beta_buf{&beta, sycl::range<1>(1)};
-
-    old_rr_buf.set_final_data(nullptr);
-    new_rr_buf.set_final_data(nullptr);
-    pAp_buf.set_final_data(nullptr);
-    alpha_buf.set_final_data(nullptr);
-    beta_buf.set_final_data(nullptr);
+    // SpMV uses 32-bit indices (halves col_ind bandwidth on the GPU); the
+    // IC0 apply itself stays on size_t because its tables hold size_t.
+    auto& row_ptr_u32 = mat.row_ptr_u32_ref();
+    auto& col_ind_u32 = mat.col_ind_u32_ref();
+    sycl::buffer<uint32_t> row_ptr32_buf{row_ptr_u32.data(), sycl::range<1>(row_ptr_u32.size())};
+    sycl::buffer<uint32_t> col_ind32_buf{col_ind_u32.data(), sycl::range<1>(col_ind_u32.size())};
+    sycl::buffer<double>   val_buf{val.data(), sycl::range<1>(val.size())};
 
     sycl::buffer<size_t> ic0_row_ptr_buf{ic0.row_ptr.data(), sycl::range<1>(ic0.row_ptr.size())};
     sycl::buffer<size_t> ic0_col_idx_buf{ic0.col_idx.data(), sycl::range<1>(ic0.col_idx.size())};
     sycl::buffer<double> ic0_L_buf{ic0.L_vals.data(), sycl::range<1>(ic0.L_vals.size())};
     sycl::buffer<double> ic0_diag_buf{ic0.diag.data(), sycl::range<1>(ic0.diag.size())};
     sycl::buffer<size_t> ic0_diag_pos_buf{ic0.diag_pos.data(), sycl::range<1>(ic0.diag_pos.size())};
-    sycl::buffer<size_t> ic0_forward_rows_buf{ic0.forward_rows.data(), sycl::range<1>(ic0.forward_rows.size())};
-    sycl::buffer<size_t> ic0_backward_rows_buf{ic0.backward_rows.data(), sycl::range<1>(ic0.backward_rows.size())};
     sycl::buffer<size_t> ic0_upper_ptr_buf{ic0.upper_ptr.data(), sycl::range<1>(ic0.upper_ptr.size())};
     sycl::buffer<size_t> ic0_upper_row_idx_buf{ic0.upper_row_idx.data(), sycl::range<1>(ic0.upper_row_idx.size())};
     sycl::buffer<size_t> ic0_upper_pos_buf{ic0.upper_pos.data(), sycl::range<1>(ic0.upper_pos.size())};
-    std::vector<double> y_temp(n, 0.0);
-    sycl::buffer<double> y_buf{y_temp.data(), sycl::range<1>(n)};
 
-    auto apply_ic0 = [&]() {
-        applyIC0_preconditioner(q,
-                                ic0_row_ptr_buf,
-                                ic0_col_idx_buf,
-                                ic0_L_buf,
-                                ic0_diag_buf,
-                                ic0_diag_pos_buf,
-                                ic0.forward_level_ptr,
-                                ic0_forward_rows_buf,
-                                ic0.backward_level_ptr,
-                                ic0_backward_rows_buf,
-                                ic0_upper_ptr_buf,
-                                ic0_upper_row_idx_buf,
-                                ic0_upper_pos_buf,
-                                r_buf,
-                                y_buf,
-                                z_buf,
-                                n);
+    double new_rr = 0.0;  // the only host-side scalar
+    sycl::buffer<double> old_rr_buf{sycl::range<1>(1)};
+    sycl::buffer<double> new_rr_buf{sycl::range<1>(1)};
+    sycl::buffer<double> pAp_buf{sycl::range<1>(1)};
+    sycl::buffer<double> alpha_buf{sycl::range<1>(1)};
+    sycl::buffer<double> beta_buf{sycl::range<1>(1)};
+
+    r_buf .set_final_data(nullptr);
+    Ap_buf.set_final_data(nullptr);
+    z_buf .set_final_data(nullptr);
+    p_buf .set_final_data(nullptr);
+    y_buf .set_final_data(nullptr);
+    y2_buf.set_final_data(nullptr);
+    old_rr_buf.set_final_data(nullptr);
+    new_rr_buf.set_final_data(nullptr);
+    pAp_buf   .set_final_data(nullptr);
+    alpha_buf .set_final_data(nullptr);
+    beta_buf  .set_final_data(nullptr);
+
+    auto zero_scalar = [&](sycl::buffer<double>& buf) {
+        q.submit([&](sycl::handler& h) {
+            sycl::accessor acc(buf, h, sycl::write_only, sycl::no_init);
+            h.single_task([=]() { acc[0] = 0.0; });
+        });
     };
 
-    apply_ic0();
+    auto apply_ic0 = [&](sycl::buffer<double>& src, sycl::buffer<double>& dst) {
+        applyIC0_preconditioner_jacobi_device(q,
+                                              ic0_row_ptr_buf, ic0_col_idx_buf,
+                                              ic0_L_buf, ic0_diag_buf, ic0_diag_pos_buf,
+                                              ic0_upper_ptr_buf,
+                                              ic0_upper_row_idx_buf,
+                                              ic0_upper_pos_buf,
+                                              src, y_buf, y2_buf, dst,
+                                              n, jacobi_sweeps);
+    };
 
+    apply_ic0(r_buf, z_buf);
+
+    // p = z
     q.submit([&](sycl::handler& h) {
-        auto z_acc = z_buf.get_access<sycl::access::mode::read>(h);
-        auto p_acc = p_buf.get_access<sycl::access::mode::write>(h);
-        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-            p_acc[i] = z_acc[i];
-        });
+        sycl::accessor z_acc(z_buf, h, sycl::read_only);
+        sycl::accessor p_acc(p_buf, h, sycl::write_only, sycl::no_init);
+        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { p_acc[i] = z_acc[i]; });
     });
 
+    zero_scalar(old_rr_buf);
     scalar_product_parallel(q, r_buf, z_buf, old_rr_buf, n);
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor acc(old_rr_buf, h, sycl::read_only);
-        h.copy(acc, &old_rr);
-    }).wait_and_throw();
 
-    if (!std::isfinite(old_rr) || old_rr < 0.0) {
-        throw std::runtime_error("IC0 produced invalid initial residual: " + std::to_string(old_rr));
-    }
-
-    unsigned int iteration = 0;
-    unsigned int max_iter = static_cast<unsigned int>(n);
+    unsigned int       iteration = 0;
+    const unsigned int max_iter  = static_cast<unsigned int>(n);
 
     do {
-        iteration++;
+        ++iteration;
 
-        CSR_mat_vec_prod_parallel(q, p_buf, row_ptr_buf, col_ind_buf, val_buf, Ap_buf, n);
+        CSR_mat_vec_prod_parallel(q, p_buf, row_ptr32_buf, col_ind32_buf, val_buf, Ap_buf, n);
+        zero_scalar(pAp_buf);
         scalar_product_parallel(q, p_buf, Ap_buf, pAp_buf, n);
 
+        // alpha = old_rr / pAp on device.
         q.submit([&](sycl::handler& h) {
-            auto old_rr_acc = old_rr_buf.get_access<sycl::access::mode::read>(h);
-            auto pAp_acc = pAp_buf.get_access<sycl::access::mode::read_write>(h);
-            auto alpha_acc = alpha_buf.get_access<sycl::access::mode::write>(h);
-            auto new_rr_acc = new_rr_buf.get_access<sycl::access::mode::write>(h);
+            sycl::accessor old_rr_acc(old_rr_buf, h, sycl::read_only);
+            sycl::accessor pAp_acc   (pAp_buf,    h, sycl::read_only);
+            sycl::accessor alpha_acc (alpha_buf,  h, sycl::write_only, sycl::no_init);
             h.single_task([=]() {
-                alpha_acc[0] = (std::abs(pAp_acc[0]) > 1e-30) ? old_rr_acc[0] / pAp_acc[0] : 0.0;
-                new_rr_acc[0] = 0.0;
-                pAp_acc[0] = 0.0;
+                const double pv = pAp_acc[0];
+                alpha_acc[0] = (std::abs(pv) > 1e-30) ? old_rr_acc[0] / pv : 0.0;
             });
         });
 
+        // x += alpha p ; r -= alpha Ap
         q.submit([&](sycl::handler& h) {
-            auto x_acc = x_buf.get_access<sycl::access::mode::read_write>(h);
-            auto r_acc = r_buf.get_access<sycl::access::mode::read_write>(h);
-            auto p_acc = p_buf.get_access<sycl::access::mode::read>(h);
-            auto Ap_acc = Ap_buf.get_access<sycl::access::mode::read>(h);
-            auto alpha_acc = alpha_buf.get_access<sycl::access::mode::read>(h);
-
+            sycl::accessor x_acc    (x_buf,     h, sycl::read_write);
+            sycl::accessor r_acc    (r_buf,     h, sycl::read_write);
+            sycl::accessor p_acc    (p_buf,     h, sycl::read_only);
+            sycl::accessor Ap_acc   (Ap_buf,    h, sycl::read_only);
+            sycl::accessor alpha_acc(alpha_buf, h, sycl::read_only);
             h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-                x_acc[i] += alpha_acc[0] * p_acc[i];
-                r_acc[i] -= alpha_acc[0] * Ap_acc[i];
+                const double a = alpha_acc[0];
+                x_acc[i] += a * p_acc[i];
+                r_acc[i] -= a * Ap_acc[i];
             });
         });
 
-        apply_ic0();
+        apply_ic0(r_buf, z_buf);
+        zero_scalar(new_rr_buf);
         scalar_product_parallel(q, r_buf, z_buf, new_rr_buf, n);
 
+        // Pull only new_rr to the host -- the only h2d sync per iteration.
         q.submit([&](sycl::handler& h) {
             sycl::accessor acc(new_rr_buf, h, sycl::read_only);
             h.copy(acc, &new_rr);
         }).wait_and_throw();
 
         if (!std::isfinite(new_rr)) {
-            throw std::runtime_error("IC0 produced invalid residual during iteration: " + std::to_string(new_rr));
+            throw std::runtime_error("IC0 produced invalid residual during iteration: "
+                                     + std::to_string(new_rr));
         }
+        if (new_rr / b_norm < eps * eps || iteration == max_iter) break;
 
-        if (new_rr / b_norm < eps * eps || iteration == max_iter) {
-            break;
-        }
-
+        // beta = new_rr / old_rr ; old_rr <- new_rr  (all on device).
         q.submit([&](sycl::handler& h) {
-            auto old_rr_acc = old_rr_buf.get_access<sycl::access::mode::read_write>(h);
-            auto new_rr_acc = new_rr_buf.get_access<sycl::access::mode::read>(h);
-            auto beta_acc = beta_buf.get_access<sycl::access::mode::write>(h);
+            sycl::accessor old_rr_acc(old_rr_buf, h, sycl::read_write);
+            sycl::accessor new_rr_acc(new_rr_buf, h, sycl::read_only);
+            sycl::accessor beta_acc  (beta_buf,   h, sycl::write_only, sycl::no_init);
             h.single_task([=]() {
-                beta_acc[0] = (std::abs(old_rr_acc[0]) > 1e-30) ? new_rr_acc[0] / old_rr_acc[0] : 0.0;
+                const double old_v = old_rr_acc[0];
+                beta_acc[0]   = (std::abs(old_v) > 1e-30) ? new_rr_acc[0] / old_v : 0.0;
                 old_rr_acc[0] = new_rr_acc[0];
             });
         });
 
+        // p = z + beta p
         q.submit([&](sycl::handler& h) {
-            auto p_acc = p_buf.get_access<sycl::access::mode::read_write>(h);
-            auto z_acc = z_buf.get_access<sycl::access::mode::read>(h);
-            auto beta_acc = beta_buf.get_access<sycl::access::mode::read>(h);
+            sycl::accessor p_acc   (p_buf,    h, sycl::read_write);
+            sycl::accessor z_acc   (z_buf,    h, sycl::read_only);
+            sycl::accessor beta_acc(beta_buf, h, sycl::read_only);
             h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
                 p_acc[i] = z_acc[i] + beta_acc[0] * p_acc[i];
             });
         });
-    } while (new_rr / b_norm > eps * eps && iteration < max_iter);
+    } while (iteration < max_iter);
 
+    // Final solution copy back to host.
     q.submit([&](sycl::handler& h) {
         sycl::accessor acc(x_buf, h, sycl::read_only);
         h.copy(acc, x.data());
@@ -906,6 +866,7 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
     std::cout << "CG-IC iterations: " << iteration << std::endl;
     return iteration;
 }
+
 
 unsigned int CG_SYCL_block_jacobi(CSR_matrix<double>& mat,
                                   std::vector<double>& x,

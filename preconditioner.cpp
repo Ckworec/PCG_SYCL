@@ -1288,211 +1288,360 @@ void ic0_factor(size_t n,
     }
 }
 
-void applyIC0_preconditioner_host(const IC0Preconditioner& ic0,
-                                  const std::vector<double>& b,
-                                  std::vector<double>& y,
-                                  std::vector<double>& x)
+// =====================================================================
+// IC0 application -- new optimised implementation (replaces the old
+// per-level GPU kernel cascade and the old host helpers).
+//
+// Two execution flavours, driven by env var IC0_JACOBI_SWEEPS:
+//   * IC0_JACOBI_SWEEPS=0  -> exact level-scheduled triangular solve
+//                             (CPU host only; on GPU we always Jacobi).
+//   * IC0_JACOBI_SWEEPS=N>=1 (default 2) -> N Jacobi sweeps in each
+//                             direction. Each sweep is one bulk
+//                             parallel pass and is dramatically cheaper
+//                             than firing thousands of tiny per-level
+//                             kernels on the GPU.
+//
+// On the CPU we bypass SYCL entirely (per-launch overhead through the
+// CPU OpenCL queue is multiple ms). A persistent thread pool with
+// spin-wait dispatch keeps fork-join cost ~1us instead of the ~50us
+// std::thread spawn cost on Windows.
+// =====================================================================
+
+namespace ic0_apply_detail {
+
+inline int read_jacobi_sweeps_env(int default_sweeps = 2)
 {
-    const size_t n = b.size();
-    if (y.size() != n) {
-        y.resize(n);
+    if (const char* env = std::getenv("IC0_JACOBI_SWEEPS")) {
+        const int v = std::atoi(env);
+        if (v >= 0 && v <= 10) return v;
     }
-    if (x.size() != n) {
-        x.resize(n);
+    return default_sweeps;
+}
+
+class WorkerPool {
+public:
+    explicit WorkerPool(std::size_t nthreads)
+        : n_(std::max<std::size_t>(1, nthreads)),
+          stop_(false),
+          generation_(0),
+          done_count_(0),
+          fn_ptr_(nullptr),
+          begin_(0),
+          end_(0)
+    {
+        threads_.reserve(n_);
+        for (std::size_t tid = 0; tid < n_; ++tid) {
+            threads_.emplace_back([this, tid]() { worker_loop(tid); });
+        }
     }
 
-    const size_t forward_level_count = ic0.forward_level_ptr.size() - 1;
-    for (size_t level = 0; level < forward_level_count; ++level) {
-        const size_t begin = ic0.forward_level_ptr[level];
-        const size_t end = ic0.forward_level_ptr[level + 1];
-        parallel_for_chunks(begin, end, [&](size_t idx) {
-            const size_t row = ic0.forward_rows[idx];
-            const size_t diag_index = ic0.diag_pos[row];
-            double sum = b[row];
+    ~WorkerPool()
+    {
+        stop_.store(true, std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_release);
+        for (auto& t : threads_) {
+            if (t.joinable()) t.join();
+        }
+    }
 
-            for (size_t k = ic0.row_ptr[row]; k < diag_index; ++k) {
+    std::size_t num_threads() const { return n_; }
+
+    template <typename Fn>
+    void run_for(std::size_t begin, std::size_t end, Fn&& fn)
+    {
+        if (begin >= end) return;
+        const std::size_t work = end - begin;
+        if (work < 256) {
+            for (std::size_t i = begin; i < end; ++i) fn(i);
+            return;
+        }
+        TrampolineFn trampoline = +[](void* user, std::size_t i) {
+            (*static_cast<Fn*>(user))(i);
+        };
+        Fn local_fn = std::forward<Fn>(fn);
+        fn_ptr_      = trampoline;
+        fn_user_     = &local_fn;
+        begin_       = begin;
+        end_         = end;
+        done_count_.store(0, std::memory_order_release);
+        generation_.fetch_add(1, std::memory_order_acq_rel);
+        while (done_count_.load(std::memory_order_acquire) != n_) {
+            std::this_thread::yield();
+        }
+    }
+
+private:
+    using TrampolineFn = void(*)(void*, std::size_t);
+
+    void worker_loop(std::size_t tid)
+    {
+        std::uint64_t local_gen = 0;
+        while (true) {
+            while (generation_.load(std::memory_order_acquire) == local_gen) {
+                std::this_thread::yield();
+            }
+            if (stop_.load(std::memory_order_acquire)) return;
+            local_gen = generation_.load(std::memory_order_acquire);
+
+            const std::size_t work  = end_ - begin_;
+            const std::size_t chunk = (work + n_ - 1) / n_;
+            const std::size_t lo    = begin_ + tid * chunk;
+            const std::size_t hi    = std::min(end_, lo + chunk);
+            if (lo < hi) {
+                TrampolineFn fn = fn_ptr_;
+                void*       u   = fn_user_;
+                for (std::size_t i = lo; i < hi; ++i) fn(u, i);
+            }
+            done_count_.fetch_add(1, std::memory_order_acq_rel);
+        }
+    }
+
+    std::size_t                       n_;
+    std::vector<std::thread>          threads_;
+    std::atomic<bool>                 stop_;
+    std::atomic<std::uint64_t>        generation_;
+    std::atomic<std::size_t>          done_count_;
+    TrampolineFn                      fn_ptr_;
+    void*                             fn_user_  = nullptr;
+    std::size_t                       begin_;
+    std::size_t                       end_;
+};
+
+inline WorkerPool& worker_pool()
+{
+    static WorkerPool pool(std::max(1u, std::thread::hardware_concurrency()));
+    return pool;
+}
+
+inline void apply_host_exact(const IC0Preconditioner&   ic0,
+                             const std::vector<double>& src,
+                             std::vector<double>&       y,
+                             std::vector<double>&       dst)
+{
+    const std::size_t flc =
+        ic0.forward_level_ptr.empty() ? 0 : ic0.forward_level_ptr.size() - 1;
+    const std::size_t blc =
+        ic0.backward_level_ptr.empty() ? 0 : ic0.backward_level_ptr.size() - 1;
+    auto& pool = worker_pool();
+
+    for (std::size_t level = 0; level < flc; ++level) {
+        const std::size_t lb = ic0.forward_level_ptr[level];
+        const std::size_t le = ic0.forward_level_ptr[level + 1];
+        pool.run_for(lb, le, [&](std::size_t idx) {
+            const std::size_t row = ic0.forward_rows[idx];
+            const std::size_t di  = ic0.diag_pos[row];
+            double sum = src[row];
+            for (std::size_t k = ic0.row_ptr[row]; k < di; ++k) {
                 sum -= ic0.L_vals[k] * y[ic0.col_idx[k]];
             }
-
             y[row] = std::isfinite(sum) ? sum : 0.0;
         });
     }
-
-    const size_t backward_level_count = ic0.backward_level_ptr.size() - 1;
-    for (size_t level = 0; level < backward_level_count; ++level) {
-        const size_t begin = ic0.backward_level_ptr[level];
-        const size_t end = ic0.backward_level_ptr[level + 1];
-        parallel_for_chunks(begin, end, [&](size_t idx) {
-            const size_t row = ic0.backward_rows[idx];
-            double diag_value = ic0.diag[row];
-            if (!std::isfinite(diag_value) || std::abs(diag_value) < 1e-14) {
-                diag_value = 1e-14;
+    for (std::size_t level = 0; level < blc; ++level) {
+        const std::size_t lb = ic0.backward_level_ptr[level];
+        const std::size_t le = ic0.backward_level_ptr[level + 1];
+        pool.run_for(lb, le, [&](std::size_t idx) {
+            const std::size_t row = ic0.backward_rows[idx];
+            double d = ic0.diag[row];
+            if (!std::isfinite(d) || std::abs(d) < 1e-14) d = 1e-14;
+            double sum = y[row] / d;
+            for (std::size_t pp = ic0.upper_ptr[row]; pp < ic0.upper_ptr[row + 1]; ++pp) {
+                sum -= ic0.L_vals[ic0.upper_pos[pp]] * dst[ic0.upper_row_idx[pp]];
             }
-
-            double sum = y[row] / diag_value;
-            for (size_t ptr = ic0.upper_ptr[row]; ptr < ic0.upper_ptr[row + 1]; ++ptr) {
-                sum -= ic0.L_vals[ic0.upper_pos[ptr]] * x[ic0.upper_row_idx[ptr]];
-            }
-
-            x[row] = std::isfinite(sum) ? sum : 0.0;
+            dst[row] = std::isfinite(sum) ? sum : 0.0;
         });
     }
 }
 
-void applyIC0_preconditioner_host(const IC0Preconditioner& ic0,
+inline void apply_host_jacobi(const IC0Preconditioner&   ic0,
+                              const std::vector<double>& src,
+                              std::vector<double>&       y,
+                              std::vector<double>&       y_tmp,
+                              std::vector<double>&       dst,
+                              int                        ns)
+{
+    const std::size_t n = src.size();
+    auto& pool = worker_pool();
+
+    auto fwd_sweep = [&](const std::vector<double>& yin,
+                         std::vector<double>&       yout,
+                         bool                       init) {
+        pool.run_for(0, n, [&, init](std::size_t i) {
+            double s = src[i];
+            if (!init) {
+                const std::size_t di = ic0.diag_pos[i];
+                for (std::size_t k = ic0.row_ptr[i]; k < di; ++k) {
+                    s -= ic0.L_vals[k] * yin[ic0.col_idx[k]];
+                }
+            }
+            yout[i] = std::isfinite(s) ? s : 0.0;
+        });
+    };
+
+    auto bwd_sweep = [&](const std::vector<double>& yfwd,
+                         const std::vector<double>& xin,
+                         std::vector<double>&       xout,
+                         bool                       init) {
+        pool.run_for(0, n, [&, init](std::size_t i) {
+            double d = ic0.diag[i];
+            if (!std::isfinite(d) || std::abs(d) < 1e-14) d = 1e-14;
+            double s = yfwd[i] / d;
+            if (!init) {
+                const std::size_t s0 = ic0.upper_ptr[i];
+                const std::size_t s1 = ic0.upper_ptr[i + 1];
+                for (std::size_t pp = s0; pp < s1; ++pp) {
+                    s -= ic0.L_vals[ic0.upper_pos[pp]] * xin[ic0.upper_row_idx[pp]];
+                }
+            }
+            xout[i] = std::isfinite(s) ? s : 0.0;
+        });
+    };
+
+    const bool fwd_last_into_y = (ns % 2 == 1);
+    std::vector<double>* fwd_first  = fwd_last_into_y ? &y     : &y_tmp;
+    std::vector<double>* fwd_second = fwd_last_into_y ? &y_tmp : &y;
+
+    fwd_sweep(*fwd_first, *fwd_first, /*init=*/true);
+    for (int s = 1; s < ns; ++s) {
+        std::vector<double>* yin  = (s % 2 == 1) ? fwd_first  : fwd_second;
+        std::vector<double>* yout = (s % 2 == 1) ? fwd_second : fwd_first;
+        fwd_sweep(*yin, *yout, /*init=*/false);
+    }
+
+    const bool bwd_starts_in_dst = (ns % 2 == 1);
+    std::vector<double>* bwd_first  = bwd_starts_in_dst ? &dst   : &y_tmp;
+    std::vector<double>* bwd_second = bwd_starts_in_dst ? &y_tmp : &dst;
+
+    bwd_sweep(y, *bwd_first, *bwd_first, /*init=*/true);
+    for (int s = 1; s < ns; ++s) {
+        std::vector<double>* xin  = (s % 2 == 1) ? bwd_first  : bwd_second;
+        std::vector<double>* xout = (s % 2 == 1) ? bwd_second : bwd_first;
+        bwd_sweep(y, *xin, *xout, /*init=*/false);
+    }
+}
+
+} // namespace ic0_apply_detail
+
+void applyIC0_preconditioner_host(const IC0Preconditioner&   ic0,
                                   const std::vector<double>& b,
-                                  std::vector<double>& x)
+                                  std::vector<double>&       y,
+                                  std::vector<double>&       x)
 {
-    std::vector<double> y;
-    applyIC0_preconditioner_host(ic0, b, y, x);
+    const std::size_t n = b.size();
+    if (y.size() != n) y.resize(n);
+    if (x.size() != n) x.resize(n);
+
+    const int ns = ic0_apply_detail::read_jacobi_sweeps_env(2);
+    if (ns <= 0) {
+        ic0_apply_detail::apply_host_exact(ic0, b, y, x);
+    } else {
+        thread_local std::vector<double> y_tmp;
+        if (y_tmp.size() != n) y_tmp.assign(n, 0.0);
+        ic0_apply_detail::apply_host_jacobi(ic0, b, y, y_tmp, x, ns);
+    }
 }
 
-void applyIC0_preconditioner(sycl::queue& q,
-                             sycl::buffer<size_t>& row_ptr_buf,
-                             sycl::buffer<size_t>& col_idx_buf,
-                             sycl::buffer<double>& L_buf,
-                             sycl::buffer<double>& diag_buf,
-                             sycl::buffer<size_t>& diag_pos_buf,
-                             const std::vector<size_t>& forward_level_ptr,
-                             sycl::buffer<size_t>& forward_rows_buf,
-                             const std::vector<size_t>& backward_level_ptr,
-                             sycl::buffer<size_t>& backward_rows_buf,
-                             sycl::buffer<size_t>& upper_ptr_buf,
-                             sycl::buffer<size_t>& upper_row_idx_buf,
-                             sycl::buffer<size_t>& upper_pos_buf,
-                             sycl::buffer<double>& b_buf,
-                             sycl::buffer<double>& y_buf,
-                             sycl::buffer<double>& x_buf,
-                             size_t n)
+// SYCL Jacobi-sweep IC0 apply for the GPU. Each sweep is a single bulk
+// parallel_for over n rows; ns total sweeps in each direction. y_buf and
+// y2_buf alternate as ping-pong scratch; final result lands in dst_buf.
+void applyIC0_preconditioner_jacobi_device(sycl::queue&              q,
+                                           sycl::buffer<size_t>&     row_ptr_buf,
+                                           sycl::buffer<size_t>&     col_idx_buf,
+                                           sycl::buffer<double>&     L_buf,
+                                           sycl::buffer<double>&     diag_buf,
+                                           sycl::buffer<size_t>&     diag_pos_buf,
+                                           sycl::buffer<size_t>&     upper_ptr_buf,
+                                           sycl::buffer<size_t>&     upper_row_idx_buf,
+                                           sycl::buffer<size_t>&     upper_pos_buf,
+                                           sycl::buffer<double>&     src_buf,
+                                           sycl::buffer<double>&     y_buf,
+                                           sycl::buffer<double>&     y2_buf,
+                                           sycl::buffer<double>&     dst_buf,
+                                           size_t                    n,
+                                           int                       ns)
 {
-    const size_t forward_level_count = forward_level_ptr.empty() ? 0 : forward_level_ptr.size() - 1;
-    const size_t backward_level_count = backward_level_ptr.empty() ? 0 : backward_level_ptr.size() - 1;
-    const size_t avg_forward_width =
-        (forward_level_count > 0) ? (n + forward_level_count - 1) / forward_level_count : n;
-    const size_t avg_backward_width =
-        (backward_level_count > 0) ? (n + backward_level_count - 1) / backward_level_count : n;
-    // Keep all GPU computations on device; host path is CPU-only.
-    const bool prefer_host_parallel = q.get_device().is_cpu();
+    if (ns < 1) ns = 1;
 
-    if (prefer_host_parallel) {
-        q.wait();
-
-        sycl::host_accessor row_ptr(row_ptr_buf, sycl::read_only);
-        sycl::host_accessor col_idx(col_idx_buf, sycl::read_only);
-        sycl::host_accessor L(L_buf, sycl::read_only);
-        sycl::host_accessor diag(diag_buf, sycl::read_only);
-        sycl::host_accessor diag_pos(diag_pos_buf, sycl::read_only);
-        sycl::host_accessor forward_rows(forward_rows_buf, sycl::read_only);
-        sycl::host_accessor backward_rows(backward_rows_buf, sycl::read_only);
-        sycl::host_accessor upper_ptr(upper_ptr_buf, sycl::read_only);
-        sycl::host_accessor upper_row_idx(upper_row_idx_buf, sycl::read_only);
-        sycl::host_accessor upper_pos(upper_pos_buf, sycl::read_only);
-        sycl::host_accessor b(b_buf, sycl::read_only);
-        sycl::host_accessor y(y_buf, sycl::read_write);
-        sycl::host_accessor x(x_buf, sycl::write_only, sycl::no_init);
-
-        for (size_t level = 0; level < forward_level_count; ++level) {
-            const size_t begin = forward_level_ptr[level];
-            const size_t end = forward_level_ptr[level + 1];
-
-            parallel_for_chunks(begin, end, [&](size_t idx) {
-                const size_t row = forward_rows[idx];
-                const size_t diag_index = diag_pos[row];
-                double sum = b[row];
-
-                for (size_t k = row_ptr[row]; k < diag_index; ++k) {
-                    sum -= L[k] * y[col_idx[k]];
+    auto fwd_sweep = [&](sycl::buffer<double>& src_in,
+                         sycl::buffer<double>& y_in,
+                         sycl::buffer<double>& y_out,
+                         bool                  init) {
+        q.submit([&, init](sycl::handler& h) {
+            sycl::accessor rp_acc  (row_ptr_buf,  h, sycl::read_only);
+            sycl::accessor ci_acc  (col_idx_buf,  h, sycl::read_only);
+            sycl::accessor L_acc   (L_buf,        h, sycl::read_only);
+            sycl::accessor dp_acc  (diag_pos_buf, h, sycl::read_only);
+            sycl::accessor src_acc (src_in,       h, sycl::read_only);
+            sycl::accessor yin_acc (y_in,         h, sycl::read_only);
+            sycl::accessor yout_acc(y_out,        h, sycl::write_only, sycl::no_init);
+            const bool ini = init;
+            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+                double s = src_acc[i];
+                if (!ini) {
+                    const size_t di = dp_acc[i];
+                    for (size_t k = rp_acc[i]; k < di; ++k) {
+                        s -= L_acc[k] * yin_acc[ci_acc[k]];
+                    }
                 }
-
-                y[row] = std::isfinite(sum) ? sum : 0.0;
-            });
-        }
-
-        for (size_t level = 0; level < backward_level_count; ++level) {
-            const size_t begin = backward_level_ptr[level];
-            const size_t end = backward_level_ptr[level + 1];
-
-            parallel_for_chunks(begin, end, [&](size_t idx) {
-                const size_t row = backward_rows[idx];
-                double diag_value = diag[row];
-                if (!std::isfinite(diag_value) || std::abs(diag_value) < 1e-14) {
-                    diag_value = 1e-14;
-                }
-
-                double sum = y[row] / diag_value;
-                for (size_t ptr = upper_ptr[row]; ptr < upper_ptr[row + 1]; ++ptr) {
-                    sum -= L[upper_pos[ptr]] * x[upper_row_idx[ptr]];
-                }
-
-                x[row] = std::isfinite(sum) ? sum : 0.0;
-            });
-        }
-        return;
-    }
-
-    for (size_t level = 0; level < forward_level_count; ++level) {
-        const size_t begin = forward_level_ptr[level];
-        const size_t end = forward_level_ptr[level + 1];
-        if (end <= begin) {
-            continue;
-        }
-
-        q.submit([&](sycl::handler& h) {
-            auto row_ptr = row_ptr_buf.get_access<sycl::access::mode::read>(h);
-            auto col_idx = col_idx_buf.get_access<sycl::access::mode::read>(h);
-            auto L = L_buf.get_access<sycl::access::mode::read>(h);
-            auto diag_pos = diag_pos_buf.get_access<sycl::access::mode::read>(h);
-            auto level_rows = forward_rows_buf.get_access<sycl::access::mode::read>(h);
-            auto b = b_buf.get_access<sycl::access::mode::read>(h);
-            auto y = y_buf.get_access<sycl::access::mode::read_write>(h);
-
-            h.parallel_for(sycl::range<1>(end - begin), [=](sycl::id<1> idx) {
-                const size_t row = level_rows[begin + idx[0]];
-                const size_t diag_index = diag_pos[row];
-                double sum = b[row];
-
-                for (size_t k = row_ptr[row]; k < diag_index; ++k) {
-                    sum -= L[k] * y[col_idx[k]];
-                }
-
-                y[row] = std::isfinite(sum) ? sum : 0.0;
+                yout_acc[i] = std::isfinite(s) ? s : 0.0;
             });
         });
-    }
+    };
 
-    for (size_t level = 0; level < backward_level_count; ++level) {
-        const size_t begin = backward_level_ptr[level];
-        const size_t end = backward_level_ptr[level + 1];
-        if (end <= begin) {
-            continue;
-        }
-
-        q.submit([&](sycl::handler& h) {
-            auto L = L_buf.get_access<sycl::access::mode::read>(h);
-            auto diag = diag_buf.get_access<sycl::access::mode::read>(h);
-            auto level_rows = backward_rows_buf.get_access<sycl::access::mode::read>(h);
-            auto upper_ptr = upper_ptr_buf.get_access<sycl::access::mode::read>(h);
-            auto upper_row_idx = upper_row_idx_buf.get_access<sycl::access::mode::read>(h);
-            auto upper_pos = upper_pos_buf.get_access<sycl::access::mode::read>(h);
-            auto y = y_buf.get_access<sycl::access::mode::read>(h);
-            auto x = x_buf.get_access<sycl::access::mode::read_write>(h);
-
-            h.parallel_for(sycl::range<1>(end - begin), [=](sycl::id<1> idx) {
-                const size_t row = level_rows[begin + idx[0]];
-                double diag_value = diag[row];
-                if (!std::isfinite(diag_value) || std::abs(diag_value) < 1e-14) {
-                    diag_value = 1e-14;
+    auto bwd_sweep = [&](sycl::buffer<double>& y_fwd,
+                         sycl::buffer<double>& x_in,
+                         sycl::buffer<double>& x_out,
+                         bool                  init) {
+        q.submit([&, init](sycl::handler& h) {
+            sycl::accessor L_acc    (L_buf,             h, sycl::read_only);
+            sycl::accessor dg_acc   (diag_buf,          h, sycl::read_only);
+            sycl::accessor up_acc   (upper_ptr_buf,     h, sycl::read_only);
+            sycl::accessor uri_acc  (upper_row_idx_buf, h, sycl::read_only);
+            sycl::accessor upos_acc (upper_pos_buf,     h, sycl::read_only);
+            sycl::accessor y_acc    (y_fwd,             h, sycl::read_only);
+            sycl::accessor xin_acc  (x_in,              h, sycl::read_only);
+            sycl::accessor xout_acc (x_out,             h, sycl::write_only, sycl::no_init);
+            const bool ini = init;
+            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+                double d = dg_acc[i];
+                if (!std::isfinite(d) || std::abs(d) < 1e-14) d = 1e-14;
+                double s = y_acc[i] / d;
+                if (!ini) {
+                    const size_t s0 = up_acc[i];
+                    const size_t s1 = up_acc[i + 1];
+                    for (size_t pp = s0; pp < s1; ++pp) {
+                        s -= L_acc[upos_acc[pp]] * xin_acc[uri_acc[pp]];
+                    }
                 }
-
-                double sum = y[row] / diag_value;
-                for (size_t ptr = upper_ptr[row]; ptr < upper_ptr[row + 1]; ++ptr) {
-                    sum -= L[upper_pos[ptr]] * x[upper_row_idx[ptr]];
-                }
-
-                x[row] = std::isfinite(sum) ? sum : 0.0;
+                xout_acc[i] = std::isfinite(s) ? s : 0.0;
             });
         });
-    }
+    };
 
-    q.wait();
+    // Forward: parity so the LAST sweep writes into y_buf.
+    const bool fwd_last_into_y_buf = (ns % 2 == 1);
+    sycl::buffer<double>* fwd_first  = fwd_last_into_y_buf ? &y_buf  : &y2_buf;
+    sycl::buffer<double>* fwd_second = fwd_last_into_y_buf ? &y2_buf : &y_buf;
+
+    fwd_sweep(src_buf, *fwd_first, *fwd_first, /*init=*/true);
+    for (int s = 1; s < ns; ++s) {
+        sycl::buffer<double>* yin  = (s % 2 == 1) ? fwd_first  : fwd_second;
+        sycl::buffer<double>* yout = (s % 2 == 1) ? fwd_second : fwd_first;
+        fwd_sweep(src_buf, *yin, *yout, /*init=*/false);
+    }
+    // Forward result lives in y_buf.
+
+    // Backward: result must end in dst_buf.
+    const bool bwd_starts_in_dst = (ns % 2 == 1);
+    sycl::buffer<double>* bwd_first  = bwd_starts_in_dst ? &dst_buf : &y2_buf;
+    sycl::buffer<double>* bwd_second = bwd_starts_in_dst ? &y2_buf  : &dst_buf;
+
+    bwd_sweep(y_buf, *bwd_first, *bwd_first, /*init=*/true);
+    for (int s = 1; s < ns; ++s) {
+        sycl::buffer<double>* xin  = (s % 2 == 1) ? bwd_first  : bwd_second;
+        sycl::buffer<double>* xout = (s % 2 == 1) ? bwd_second : bwd_first;
+        bwd_sweep(y_buf, *xin, *xout, /*init=*/false);
+    }
+    // Result now in dst_buf.
 }
+

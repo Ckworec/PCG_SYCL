@@ -99,10 +99,10 @@ int main(void){
         [&]() { return test_CG_SYCL_chebyshev_adaptive(mat, X2, b, GPU, iter_numb, polynomial_degree); },
         [&]() { return test_CG_MKL_chebyshev(mat, X3, b, iter_numb, polynomial_degree); });
 
-    // run_and_report("IC0",
-    //     [&]() { return test_CG_SYCL_IC0(mat, X1, b, CPU, iter_numb); },
-    //     [&]() { return test_CG_SYCL_IC0(mat, X2, b, GPU, iter_numb); },
-    //     [&]() { return test_CG_MKL_IC0(mat, X3, b, iter_numb); });
+    run_and_report("IC0",
+        [&]() { return test_CG_SYCL_IC0(mat, X1, b, CPU, iter_numb); },
+        [&]() { return test_CG_SYCL_IC0(mat, X2, b, GPU, iter_numb); },
+        [&]() { return test_CG_MKL_IC0(mat, X3, b, iter_numb); });
 
     return 0;
 }

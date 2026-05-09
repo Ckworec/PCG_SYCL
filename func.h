@@ -437,32 +437,33 @@ void ic0_factor(size_t n,
                 const std::vector<double>& vals,
                 IC0Preconditioner& ic0);
 
+// IC0 application -- writes x = M^{-1} b on the host. y is reused as the
+// forward-pass scratch / Jacobi ping-pong buffer. Uses Jacobi sweeps by
+// default (env IC0_JACOBI_SWEEPS, default 2; 0 selects exact level-
+// scheduled mode).
 void applyIC0_preconditioner_host(const IC0Preconditioner& ic0,
                                   const std::vector<double>& b,
                                   std::vector<double>& y,
                                   std::vector<double>& x);
 
-void applyIC0_preconditioner_host(const IC0Preconditioner& ic0,
-                                  const std::vector<double>& b,
-                                  std::vector<double>& x);
-
-void applyIC0_preconditioner(sycl::queue& q,
-                             sycl::buffer<size_t>& row_ptr_buf,
-                             sycl::buffer<size_t>& col_idx_buf,
-                             sycl::buffer<double>& L_buf,
-                             sycl::buffer<double>& diag_buf,
-                             sycl::buffer<size_t>& diag_pos_buf,
-                             const std::vector<size_t>& forward_level_ptr,
-                             sycl::buffer<size_t>& forward_rows_buf,
-                             const std::vector<size_t>& backward_level_ptr,
-                             sycl::buffer<size_t>& backward_rows_buf,
-                             sycl::buffer<size_t>& upper_ptr_buf,
-                             sycl::buffer<size_t>& upper_row_idx_buf,
-                             sycl::buffer<size_t>& upper_pos_buf,
-                             sycl::buffer<double>& b_buf,
-                             sycl::buffer<double>& y_buf,
-                             sycl::buffer<double>& x_buf,
-                             size_t n);
+// SYCL Jacobi-sweep IC0 apply for the GPU. Each sweep is one bulk
+// parallel_for over n rows; ns total sweeps in each direction. y_buf and
+// y2_buf alternate as ping-pong scratch; final result lands in dst_buf.
+void applyIC0_preconditioner_jacobi_device(sycl::queue& q,
+                                           sycl::buffer<size_t>& row_ptr_buf,
+                                           sycl::buffer<size_t>& col_idx_buf,
+                                           sycl::buffer<double>& L_buf,
+                                           sycl::buffer<double>& diag_buf,
+                                           sycl::buffer<size_t>& diag_pos_buf,
+                                           sycl::buffer<size_t>& upper_ptr_buf,
+                                           sycl::buffer<size_t>& upper_row_idx_buf,
+                                           sycl::buffer<size_t>& upper_pos_buf,
+                                           sycl::buffer<double>& src_buf,
+                                           sycl::buffer<double>& y_buf,
+                                           sycl::buffer<double>& y2_buf,
+                                           sycl::buffer<double>& dst_buf,
+                                           size_t n,
+                                           int ns);
 
 // -------------- Solvers -----------------
 
