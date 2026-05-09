@@ -101,30 +101,6 @@ static std::vector<double> build_jacobi_inverse(const std::vector<size_t>& row_p
     return inv_diag;
 }
 
-static std::vector<double> build_spai_diagonal(const std::vector<size_t>& row_ptr,
-                                               const std::vector<size_t>& col_ind,
-                                               const std::vector<double>& val)
-{
-    const size_t n = row_ptr.size() - 1;
-    std::vector<double> spai_diag(n, 0.0);
-    std::vector<size_t> diag_pos;
-    build_diag_positions(row_ptr, col_ind, diag_pos);
-
-    for (size_t i = 0; i < n; ++i) {
-        double row_sq_sum = 0.0;
-        for (size_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
-            row_sq_sum += val[k] * val[k];
-        }
-
-        const double diag = val[diag_pos[i]];
-        if (std::abs(diag) > 1e-14 && row_sq_sum > 1e-28) {
-            spai_diag[i] = diag / row_sq_sum;
-        }
-    }
-
-    return spai_diag;
-}
-
 static double estimate_gershgorin_upper_bound_scaled(const std::vector<size_t>& row_ptr,
                                                      const std::vector<double>& val,
                                                      const std::vector<double>& inv_diag)
@@ -484,22 +460,6 @@ unsigned int CG_MKL_plain(CSR_matrix<double>& mat,
             for (size_t i = 0; i < n; ++i) {
                 z[i] = r[i];
             }
-        });
-    });
-}
-
-unsigned int CG_MKL_SPAI(CSR_matrix<double>& mat,
-                         std::vector<double>& x,
-                         std::vector<double>& b)
-{
-    const std::vector<size_t>& row_ptr = mat.row_ptr_ref();
-    const std::vector<size_t>& col_ind = mat.col_ind_ref();
-    const std::vector<double>& val = mat.val_ref();
-    const std::vector<double> spai_diag = build_spai_diagonal(row_ptr, col_ind, val);
-
-    return run_with_mkl_max_threads([&]() {
-        return run_mkl_cg(mat, x, b, [&](const double* r, double* z) {
-            apply_diagonal_host(spai_diag, r, z);
         });
     });
 }

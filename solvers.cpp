@@ -1,11 +1,6 @@
 #include "func.h"
 #include <memory>
 
-static double refine_lambda_min_from_delta_local(double delta,
-                                                 double lambda_min_estimate,
-                                                 double lambda_max_estimate,
-                                                 size_t degree);
-
 static double scalar_product_host(const std::vector<double>& a,
                                   const std::vector<double>& b)
 {
@@ -44,212 +39,6 @@ static std::vector<double> build_jacobi_inverse_host_local(const std::vector<siz
     });
 
     return inv_diag;
-}
-
-static double build_jacobi_inverse_and_gershgorin_bound_local(const std::vector<size_t>& row_ptr,
-                                                              const std::vector<size_t>& diag_pos,
-                                                              const std::vector<double>& val,
-                                                              std::vector<double>& inv_diag)
-{
-    const size_t n = row_ptr.size() - 1;
-    inv_diag.assign(n, 0.0);
-
-    return parallel_max_host<double>(0, n, 8192, 0.0, [&](size_t i) {
-        double row_sum = 0.0;
-        for (size_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
-            row_sum += std::abs(val[k]);
-        }
-
-        const double diag = val[diag_pos[i]];
-        const double diagonal_inverse = (std::abs(diag) > 1e-14) ? (1.0 / diag) : 0.0;
-        inv_diag[i] = diagonal_inverse;
-        return std::abs(diagonal_inverse) * row_sum;
-    });
-}
-
-static double estimate_gershgorin_upper_bound_scaled_local(const std::vector<size_t>& row_ptr,
-                                                           const std::vector<double>& val,
-                                                           const std::vector<double>& inv_diag)
-{
-    const size_t n = inv_diag.size();
-    return parallel_max_host<double>(0, n, 8192, 0.0, [&](size_t i) {
-        double row_sum = 0.0;
-        for (size_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
-            row_sum += std::abs(val[k]);
-        }
-        return std::abs(inv_diag[i]) * row_sum;
-    });
-}
-
-static double estimate_chebyshev_lambda_min_scaled_fast_local(const std::vector<size_t>& row_ptr,
-                                                              const std::vector<size_t>& col_ind,
-                                                              const std::vector<double>& val,
-                                                              const std::vector<double>& inv_diag,
-                                                              const std::vector<double>& rhs,
-                                                              double lambda_max_estimate)
-{
-    if (lambda_max_estimate <= 1e-14) {
-        return std::max(1e-14, 1e-6 * lambda_max_estimate);
-    }
-
-    std::vector<double> probe = rhs;
-    double probe_norm_sq = scalar_product_host(probe, probe);
-    if (probe_norm_sq < 1e-20) {
-        probe.assign(rhs.size(), 1.0);
-        probe_norm_sq = static_cast<double>(rhs.size());
-    }
-
-    std::vector<double> temp(rhs.size(), 0.0);
-    csr_mat_vec_prod_host(row_ptr, col_ind, val, probe, temp);
-
-    const size_t n = probe.size();
-    const double rayleigh = parallel_sum_host<double>(0, n, 16384, 0.0, [&](size_t i) {
-        return probe[i] * inv_diag[i] * temp[i];
-    });
-
-    const double lambda_min_estimate = (probe_norm_sq > 1e-30)
-        ? (rayleigh / probe_norm_sq)
-        : lambda_max_estimate;
-    return std::clamp(lambda_min_estimate, 1e-14, 0.999999 * lambda_max_estimate);
-}
-
-static double estimate_scaled_lambda_max_power_local(const std::vector<size_t>& row_ptr,
-                                                     const std::vector<size_t>& col_ind,
-                                                     const std::vector<double>& val,
-                                                     const std::vector<double>& inv_diag,
-                                                     const std::vector<double>& rhs,
-                                                     size_t power_iterations = 12)
-{
-    const size_t n = inv_diag.size();
-    if (n == 0) {
-        return 0.0;
-    }
-
-    std::vector<double> x = rhs;
-    double x_norm_sq = scalar_product_host(x, x);
-    if (x_norm_sq < 1e-20) {
-        x.assign(n, 1.0);
-        x_norm_sq = static_cast<double>(n);
-    }
-
-    const double x_norm = std::sqrt(std::max(x_norm_sq, 1e-300));
-    parallel_for_host(0, n, 16384, [&](size_t i) {
-        x[i] /= x_norm;
-    });
-
-    std::vector<double> sqrt_inv_diag(n, 0.0);
-    std::vector<double> scaled_x(n, 0.0);
-    std::vector<double> y(n, 0.0);
-
-    parallel_for_host(0, n, 16384, [&](size_t i) {
-        sqrt_inv_diag[i] = std::sqrt(std::max(inv_diag[i], 0.0));
-    });
-
-    double lambda_max_estimate = 0.0;
-    for (size_t iter = 0; iter < power_iterations; ++iter) {
-        parallel_for_host(0, n, 16384, [&](size_t i) {
-            scaled_x[i] = sqrt_inv_diag[i] * x[i];
-        });
-
-        csr_mat_vec_prod_host(row_ptr, col_ind, val, scaled_x, y);
-
-        parallel_for_host(0, n, 16384, [&](size_t i) {
-            const double scaled_value = sqrt_inv_diag[i] * y[i];
-            scaled_x[i] = scaled_value;
-        });
-
-        const double rayleigh = parallel_sum_host<double>(0, n, 16384, 0.0, [&](size_t i) {
-            return x[i] * scaled_x[i];
-        });
-        const double y_norm_sq = parallel_sum_host<double>(0, n, 16384, 0.0, [&](size_t i) {
-            return scaled_x[i] * scaled_x[i];
-        });
-
-        lambda_max_estimate = std::max(lambda_max_estimate, rayleigh);
-        if (y_norm_sq < 1e-30) {
-            break;
-        }
-
-        const double y_norm = std::sqrt(y_norm_sq);
-        parallel_for_host(0, n, 16384, [&](size_t i) {
-            x[i] = scaled_x[i] / y_norm;
-        });
-    }
-
-    return lambda_max_estimate;
-}
-
-static double refine_lambda_min_from_delta_local(double delta,
-                                                 double lambda_min_estimate,
-                                                 double lambda_max_estimate,
-                                                 size_t degree)
-{
-    if (!std::isfinite(delta) || degree == 0) {
-        return lambda_min_estimate;
-    }
-
-    const double eta = std::clamp(lambda_min_estimate / lambda_max_estimate, 1e-30, 0.999999);
-    const double sqrt_eta = std::sqrt(eta);
-    const double rho = (1.0 - sqrt_eta) / std::max(1e-30, 1.0 + sqrt_eta);
-    const double p = static_cast<double>(degree);
-    const double qp = 2.0 / (std::pow(rho, p) + std::pow(rho, -p));
-    const double y1 = delta / std::max(qp, 1e-300);
-
-    if (y1 <= 1.0) {
-        return lambda_min_estimate;
-    }
-
-    const double x_star = std::cosh(std::acosh(y1) / p);
-    const double lambda_new = lambda_max_estimate *
-        (0.5 * (1.0 + eta) - 0.5 * (1.0 - eta) * x_star);
-
-    if (!std::isfinite(lambda_new)) {
-        return lambda_min_estimate;
-    }
-
-    return std::clamp(lambda_new, 1e-14, 0.999999 * lambda_max_estimate);
-}
-
-static double refine_chebyshev_lambda_min_scaled_local(const std::vector<size_t>& row_ptr,
-                                                       const std::vector<size_t>& col_ind,
-                                                       const std::vector<double>& val,
-                                                       const std::vector<double>& inv_diag,
-                                                       const std::vector<double>& rhs,
-                                                       double lambda_min_estimate,
-                                                       double lambda_max_estimate,
-                                                       size_t degree)
-{
-    if (degree == 0 || rhs.empty()) {
-        return lambda_min_estimate;
-    }
-
-    std::vector<double> steps;
-    build_chebyshev_steps(lambda_min_estimate, lambda_max_estimate, degree, steps);
-    if (steps.empty()) {
-        return lambda_min_estimate;
-    }
-
-    std::vector<double> t = rhs;
-    std::vector<double> w(rhs.size(), 0.0);
-    std::vector<double> tmp(rhs.size(), 0.0);
-
-    for (double tau : steps) {
-        parallel_for_host(0, rhs.size(), 16384, [&](size_t i) {
-            w[i] = inv_diag[i] * t[i];
-        });
-        csr_mat_vec_prod_host(row_ptr, col_ind, val, w, tmp);
-        parallel_for_host(0, rhs.size(), 16384, [&](size_t i) {
-            t[i] -= tau * tmp[i];
-        });
-    }
-
-    const double rhs_norm_sq = scalar_product_host(rhs, rhs);
-    if (rhs_norm_sq < 1e-30) {
-        return lambda_min_estimate;
-    }
-
-    const double delta = std::sqrt(std::max(0.0, scalar_product_host(t, t) / rhs_norm_sq));
-    return refine_lambda_min_from_delta_local(delta, lambda_min_estimate, lambda_max_estimate, degree);
 }
 
 static void initialize_diagonal_preconditioned_direction(sycl::queue& q,
@@ -572,26 +361,29 @@ unsigned int CG_SYCL_jacobi(CSR_matrix<double>& mat,
     std::cout << "iterations: " << iteration << std::endl;
     return iteration;
 }
-
 // =====================================================================
-// IC0-preconditioned CG -- new optimised implementation.
+// IC0-preconditioned CG -- port of CG_IC0_SYCL from ic0_sycl/ic0_cg_sycl.cpp.
 //
-// Two paths:
-//  * GPU SYCL queue: bulk Jacobi-sweep apply (preconditioner.cpp::
-//    applyIC0_preconditioner_jacobi_device), all CG scalars stay on the
-//    device, only new_rr is fetched per iteration to drive the
-//    convergence test, and the final x is copied once at the end.
-//  * CPU SYCL queue: bypass SYCL entirely. CG body runs on the host
-//    with the same parallel helpers as the rest of the project, and
-//    apply uses applyIC0_preconditioner_host (Jacobi by default, env
-//    IC0_JACOBI_SWEEPS=0 falls back to exact level-scheduled).
+// Two paths, selected by the SYCL device:
+//   * GPU: every CG scalar lives on the device (alpha, beta, pAp, old_rr).
+//     The Jacobi-sweep IC0 apply is invoked through
+//     applyIC0_preconditioner_jacobi_device. Only new_rr crosses to the
+//     host each iteration (it drives the convergence test); the final
+//     solution vector is copied once at the end.
+//   * CPU: bypass SYCL entirely. Submitting micro-kernels through the CPU
+//     OpenCL queue is multiple ms per launch on this stack -- with ~9
+//     kernels per CG iteration that turns into many seconds of overhead
+//     for small/medium matrices. We run a plain host CG with the same
+//     parallel helpers as the rest of the project, and apply uses
+//     applyIC0_preconditioner_host (Jacobi by default; env IC0_JACOBI_SWEEPS
+//     selects sweep count, 0 == exact level-scheduled triangular solve).
 // =====================================================================
 
 static unsigned int CG_IC0_host(const std::vector<size_t>& row_ptr,
                                 const std::vector<size_t>& col_ind,
                                 const std::vector<double>& val,
-                                const IC0Preconditioner& ic0,
-                                std::vector<double>& x,
+                                const IC0Preconditioner&   ic0,
+                                std::vector<double>&       x,
                                 const std::vector<double>& b)
 {
     const double b_norm = scalar_product_host(b, b);
@@ -613,7 +405,6 @@ static unsigned int CG_IC0_host(const std::vector<size_t>& row_ptr,
         throw std::runtime_error("IC0 produced invalid initial residual: "
                                  + std::to_string(old_rr));
     }
-
     p = z;
 
     unsigned int iteration = 0;
@@ -683,13 +474,8 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
         return 0;
     }
 
-    int jacobi_sweeps = 2;
-    if (const char* env = std::getenv("IC0_JACOBI_SWEEPS")) {
-        const int v = std::atoi(env);
-        if (v >= 1 && v <= 10) jacobi_sweeps = v;
-        else if (v == 0)       jacobi_sweeps = 1; // exact not implemented on GPU
-    }
-
+    // Sanity-check the factor: NaN/Inf in L would silently corrupt the
+    // solve and is much easier to diagnose here.
     for (size_t idx = 0; idx < ic0.L_vals.size(); ++idx) {
         if (!std::isfinite(ic0.L_vals[idx])) {
             size_t bad_row = 0;
@@ -702,6 +488,13 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
         }
     }
 
+    int jacobi_sweeps = 2;
+    if (const char* env = std::getenv("IC0_JACOBI_SWEEPS")) {
+        const int v = std::atoi(env);
+        if (v >= 1 && v <= 10) jacobi_sweeps = v;
+        else if (v == 0)       jacobi_sweeps = 1; // exact path not implemented on GPU
+    }
+
     std::vector<double> r = b;
     std::vector<double> Ap(n, 0.0);
     std::vector<double> z(n, 0.0);
@@ -709,12 +502,12 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
     std::vector<double> y_temp(n, 0.0);
     std::vector<double> y2_temp(n, 0.0);
 
-    sycl::buffer<double> r_buf{r.data(),  sycl::range<1>(n)};
-    sycl::buffer<double> Ap_buf{Ap.data(), sycl::range<1>(n)};
-    sycl::buffer<double> z_buf{z.data(),  sycl::range<1>(n)};
-    sycl::buffer<double> p_buf{p.data(),  sycl::range<1>(n)};
-    sycl::buffer<double> x_buf{x.data(),  sycl::range<1>(n)};
-    sycl::buffer<double> y_buf{y_temp.data(),  sycl::range<1>(n)};
+    sycl::buffer<double> r_buf {r.data(),       sycl::range<1>(n)};
+    sycl::buffer<double> Ap_buf{Ap.data(),      sycl::range<1>(n)};
+    sycl::buffer<double> z_buf {z.data(),       sycl::range<1>(n)};
+    sycl::buffer<double> p_buf {p.data(),       sycl::range<1>(n)};
+    sycl::buffer<double> x_buf {x.data(),       sycl::range<1>(n)};
+    sycl::buffer<double> y_buf {y_temp.data(),  sycl::range<1>(n)};
     sycl::buffer<double> y2_buf{y2_temp.data(), sycl::range<1>(n)};
 
     // SpMV uses 32-bit indices (halves col_ind bandwidth on the GPU); the
@@ -723,23 +516,25 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
     auto& col_ind_u32 = mat.col_ind_u32_ref();
     sycl::buffer<uint32_t> row_ptr32_buf{row_ptr_u32.data(), sycl::range<1>(row_ptr_u32.size())};
     sycl::buffer<uint32_t> col_ind32_buf{col_ind_u32.data(), sycl::range<1>(col_ind_u32.size())};
-    sycl::buffer<double>   val_buf{val.data(), sycl::range<1>(val.size())};
+    sycl::buffer<double>   val_buf      {val.data(),         sycl::range<1>(val.size())};
 
-    sycl::buffer<size_t> ic0_row_ptr_buf{ic0.row_ptr.data(), sycl::range<1>(ic0.row_ptr.size())};
-    sycl::buffer<size_t> ic0_col_idx_buf{ic0.col_idx.data(), sycl::range<1>(ic0.col_idx.size())};
-    sycl::buffer<double> ic0_L_buf{ic0.L_vals.data(), sycl::range<1>(ic0.L_vals.size())};
-    sycl::buffer<double> ic0_diag_buf{ic0.diag.data(), sycl::range<1>(ic0.diag.size())};
-    sycl::buffer<size_t> ic0_diag_pos_buf{ic0.diag_pos.data(), sycl::range<1>(ic0.diag_pos.size())};
-    sycl::buffer<size_t> ic0_upper_ptr_buf{ic0.upper_ptr.data(), sycl::range<1>(ic0.upper_ptr.size())};
+    sycl::buffer<size_t> ic0_row_ptr_buf      {ic0.row_ptr.data(),       sycl::range<1>(ic0.row_ptr.size())};
+    sycl::buffer<size_t> ic0_col_idx_buf      {ic0.col_idx.data(),       sycl::range<1>(ic0.col_idx.size())};
+    sycl::buffer<double> ic0_L_buf            {ic0.L_vals.data(),        sycl::range<1>(ic0.L_vals.size())};
+    sycl::buffer<double> ic0_diag_buf         {ic0.diag.data(),          sycl::range<1>(ic0.diag.size())};
+    sycl::buffer<size_t> ic0_diag_pos_buf     {ic0.diag_pos.data(),      sycl::range<1>(ic0.diag_pos.size())};
+    sycl::buffer<size_t> ic0_upper_ptr_buf    {ic0.upper_ptr.data(),     sycl::range<1>(ic0.upper_ptr.size())};
     sycl::buffer<size_t> ic0_upper_row_idx_buf{ic0.upper_row_idx.data(), sycl::range<1>(ic0.upper_row_idx.size())};
-    sycl::buffer<size_t> ic0_upper_pos_buf{ic0.upper_pos.data(), sycl::range<1>(ic0.upper_pos.size())};
+    sycl::buffer<size_t> ic0_upper_pos_buf    {ic0.upper_pos.data(),     sycl::range<1>(ic0.upper_pos.size())};
 
-    double new_rr = 0.0;  // the only host-side scalar
+    // All scalar state lives on the device. Only `new_rr` is fetched to
+    // the host every iteration to drive the convergence test.
+    double new_rr = 0.0;
     sycl::buffer<double> old_rr_buf{sycl::range<1>(1)};
     sycl::buffer<double> new_rr_buf{sycl::range<1>(1)};
-    sycl::buffer<double> pAp_buf{sycl::range<1>(1)};
-    sycl::buffer<double> alpha_buf{sycl::range<1>(1)};
-    sycl::buffer<double> beta_buf{sycl::range<1>(1)};
+    sycl::buffer<double> pAp_buf   {sycl::range<1>(1)};
+    sycl::buffer<double> alpha_buf {sycl::range<1>(1)};
+    sycl::buffer<double> beta_buf  {sycl::range<1>(1)};
 
     r_buf .set_final_data(nullptr);
     Ap_buf.set_final_data(nullptr);
@@ -793,7 +588,7 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
         zero_scalar(pAp_buf);
         scalar_product_parallel(q, p_buf, Ap_buf, pAp_buf, n);
 
-        // alpha = old_rr / pAp on device.
+        // alpha = old_rr / pAp on the device.
         q.submit([&](sycl::handler& h) {
             sycl::accessor old_rr_acc(old_rr_buf, h, sycl::read_only);
             sycl::accessor pAp_acc   (pAp_buf,    h, sycl::read_only);
@@ -822,7 +617,7 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
         zero_scalar(new_rr_buf);
         scalar_product_parallel(q, r_buf, z_buf, new_rr_buf, n);
 
-        // Pull only new_rr to the host -- the only h2d sync per iteration.
+        // Pull new_rr to the host -- the only h2d sync per iteration.
         q.submit([&](sycl::handler& h) {
             sycl::accessor acc(new_rr_buf, h, sycl::read_only);
             h.copy(acc, &new_rr);
@@ -857,7 +652,7 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
         });
     } while (iteration < max_iter);
 
-    // Final solution copy back to host.
+    // Final solution: the only x copy back to the host.
     q.submit([&](sycl::handler& h) {
         sycl::accessor acc(x_buf, h, sycl::read_only);
         h.copy(acc, x.data());
@@ -866,6 +661,8 @@ unsigned int CG_SYCL_IC0(CSR_matrix<double>& mat,
     std::cout << "CG-IC iterations: " << iteration << std::endl;
     return iteration;
 }
+
+
 
 
 unsigned int CG_SYCL_block_jacobi(CSR_matrix<double>& mat,
@@ -1011,613 +808,6 @@ unsigned int CG_SYCL_block_jacobi(CSR_matrix<double>& mat,
     return iteration;
 }
 
-unsigned int CG_SYCL_SPAI(CSR_matrix<double>& mat,
-                          std::vector<double>& x,
-                          std::vector<double>& b,
-                          sycl::queue& q)
-{
-    double b_norm = scalar_product(b, b);
-    if (b_norm < 1e-10) {
-        std::fill(x.begin(), x.end(), 0.0);
-        return 0;
-    }
-
-    auto& row_ptr = mat.row_ptr_ref();
-    auto& col_ind = mat.col_ind_ref();
-    auto& val = mat.val_ref();
-    const size_t n = row_ptr.size() - 1;
-    std::vector<double> r = b;
-    std::vector<double> Ap(n), z(n), p(n);
-    std::vector<double> M_inv(n, 0.0);
-
-    sycl::buffer<double> M_inv_buf{M_inv.data(), sycl::range<1>(n)};
-    sycl::buffer<size_t> row_ptr_buf{row_ptr.data(), sycl::range<1>(row_ptr.size())};
-    sycl::buffer<double> val_buf{val.data(), sycl::range<1>(val.size())};
-    sycl::buffer<size_t> col_ind_buf{col_ind.data(), sycl::range<1>(col_ind.size())};
-
-    // Fused kernel finds the diagonal inline: no host build_diag_positions pass
-    // and no diag_pos buffer on the device.
-    compute_spai_preconditioner_inline_buf(row_ptr_buf, col_ind_buf, val_buf, M_inv_buf, n, q);
-
-    sycl::buffer<double> r_buf{r.data(), sycl::range<1>(n)};
-    sycl::buffer<double> z_buf{z.data(), sycl::range<1>(n)};
-    sycl::buffer<double> p_buf{p.data(), sycl::range<1>(n)};
-    sycl::buffer<double> x_buf{x.data(), sycl::range<1>(n)};
-    sycl::buffer<double> Ap_buf{Ap.data(), sycl::range<1>(n)};
-
-    double old_rr = 0.0, new_rr = 0.0, pAp = 0.0, alpha = 0.0, beta = 0.0;
-    sycl::buffer<double> old_rr_buf{&old_rr, sycl::range<1>(1)};
-    sycl::buffer<double> new_rr_buf{&new_rr, sycl::range<1>(1)};
-    sycl::buffer<double> pAp_buf{&pAp, sycl::range<1>(1)};
-    sycl::buffer<double> alpha_buf{&alpha, sycl::range<1>(1)};
-    sycl::buffer<double> beta_buf{&beta, sycl::range<1>(1)};
-
-    M_inv_buf.set_final_data(nullptr);
-    r_buf.set_final_data(nullptr);
-    z_buf.set_final_data(nullptr);
-    p_buf.set_final_data(nullptr);
-    x_buf.set_final_data(nullptr);
-    Ap_buf.set_final_data(nullptr);
-    old_rr_buf.set_final_data(nullptr);
-    new_rr_buf.set_final_data(nullptr);
-    pAp_buf.set_final_data(nullptr);
-    alpha_buf.set_final_data(nullptr);
-    beta_buf.set_final_data(nullptr);
-
-    initialize_diagonal_preconditioned_direction(q, r_buf, M_inv_buf, z_buf, p_buf, old_rr_buf, n);
-
-    unsigned int iteration = 0;
-    unsigned int max_iter = static_cast<unsigned int>(n);
-    do {
-        iteration++;
-        CSR_mat_vec_prod_parallel(q, p_buf, row_ptr_buf, col_ind_buf, val_buf, Ap_buf, n);
-        scalar_product_parallel(q, p_buf, Ap_buf, pAp_buf, n);
-
-        q.submit([&](sycl::handler& h) {
-            auto old_rr_acc = old_rr_buf.get_access<sycl::access::mode::read>(h);
-            auto pAp_acc = pAp_buf.get_access<sycl::access::mode::read_write>(h);
-            auto alpha_acc = alpha_buf.get_access<sycl::access::mode::write>(h);
-            auto new_rr_acc = new_rr_buf.get_access<sycl::access::mode::write>(h);
-            h.single_task([=]() {
-                alpha_acc[0] = (std::abs(pAp_acc[0]) > 1e-30) ? old_rr_acc[0] / pAp_acc[0] : 0.0;
-                new_rr_acc[0] = 0.0;
-                pAp_acc[0] = 0.0;
-            });
-        });
-
-        update_solution_residual_and_apply_diagonal(
-            q, x_buf, r_buf, z_buf, p_buf, Ap_buf, alpha_buf, M_inv_buf, new_rr_buf, n);
-
-        q.submit([&](sycl::handler& h) {
-            auto acc = new_rr_buf.get_access<sycl::access::mode::read>(h);
-            h.copy(acc, &new_rr);
-        }).wait_and_throw();
-
-        if (new_rr / b_norm < eps * eps || iteration == max_iter) {
-            break;
-        }
-
-        q.submit([&](sycl::handler& h) {
-            auto old_rr_acc = old_rr_buf.get_access<sycl::access::mode::read_write>(h);
-            auto new_rr_acc = new_rr_buf.get_access<sycl::access::mode::read>(h);
-            auto beta_acc = beta_buf.get_access<sycl::access::mode::write>(h);
-            h.single_task([=]() {
-                beta_acc[0] = (std::abs(old_rr_acc[0]) > 1e-30) ? new_rr_acc[0] / old_rr_acc[0] : 0.0;
-                old_rr_acc[0] = new_rr_acc[0];
-            });
-        });
-
-        q.submit([&](sycl::handler& h) {
-            auto p_acc = p_buf.get_access<sycl::access::mode::read_write>(h);
-            auto z_acc = z_buf.get_access<sycl::access::mode::read>(h);
-            auto beta_acc = beta_buf.get_access<sycl::access::mode::read>(h);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-                p_acc[i] = z_acc[i] + beta_acc[0] * p_acc[i];
-            });
-        });
-    } while (new_rr / b_norm > eps * eps && iteration < max_iter);
-
-    q.submit([&](sycl::handler& h) {
-        auto acc = x_buf.get_access<sycl::access::mode::read>(h);
-        h.copy(acc, x.data());
-    }).wait_and_throw();
-    std::cout << "CG-SPAI iterations: " << iteration << std::endl;
-    return iteration;
-}
-
-// Computes M_inv (Jacobi diag inverse), Gershgorin bound, lambda_max via power
-// iteration on D^-1/2 A D^-1/2, and lambda_min via fast Rayleigh — all on the
-// device. Only two scalars are synced back to the host. Mirrors the host-side
-// setup logic in CG_SYCL_chebyshev so iteration counts stay close.
-static void chebyshev_setup_device(sycl::queue& q,
-                                   sycl::buffer<uint32_t>& row_ptr_buf,
-                                   sycl::buffer<uint32_t>& col_ind_buf,
-                                   sycl::buffer<double>& val_buf,
-                                   const std::vector<double>& b,
-                                   sycl::buffer<double>& M_inv_buf,
-                                   size_t n,
-                                   size_t power_iterations,
-                                   double power_safety,
-                                   double* out_lambda_min,
-                                   double* out_lambda_max)
-{
-    sycl::buffer<double> row_score_buf{sycl::range<1>(n)};
-    sycl::buffer<double> sqrt_minv_buf{sycl::range<1>(n)};
-    sycl::buffer<double> x_buf{sycl::range<1>(n)};
-    sycl::buffer<double> y_buf{sycl::range<1>(n)};
-    sycl::buffer<double> scaled_buf{sycl::range<1>(n)};
-    sycl::buffer<double> b_buf{const_cast<double*>(b.data()), sycl::range<1>(n)};
-    row_score_buf.set_final_data(nullptr);
-    sqrt_minv_buf.set_final_data(nullptr);
-    x_buf.set_final_data(nullptr);
-    y_buf.set_final_data(nullptr);
-    scaled_buf.set_final_data(nullptr);
-    b_buf.set_final_data(nullptr);
-
-    // Fused: M_inv[i] = 1/diag, row_score[i] = |1/diag| * sum |A_ij|
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor row_ptr(row_ptr_buf, h, sycl::read_only);
-        sycl::accessor col_ind(col_ind_buf, h, sycl::read_only);
-        sycl::accessor val(val_buf, h, sycl::read_only);
-        sycl::accessor M_inv(M_inv_buf, h, sycl::write_only, sycl::no_init);
-        sycl::accessor score(row_score_buf, h, sycl::write_only, sycl::no_init);
-        sycl::accessor sqrt_m(sqrt_minv_buf, h, sycl::write_only, sycl::no_init);
-        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-            const uint32_t row = static_cast<uint32_t>(i[0]);
-            const uint32_t begin = row_ptr[row];
-            const uint32_t end = row_ptr[row + 1];
-            double diag = 0.0;
-            double abs_sum = 0.0;
-            for (uint32_t k = begin; k < end; ++k) {
-                const double v = val[k];
-                abs_sum += sycl::fabs(v);
-                if (col_ind[k] == row) {
-                    diag = v;
-                }
-            }
-            const double m_inv = (sycl::fabs(diag) > 1e-14) ? (1.0 / diag) : 0.0;
-            M_inv[row] = m_inv;
-            score[row] = sycl::fabs(m_inv) * abs_sum;
-            sqrt_m[row] = sycl::sqrt(sycl::fmax(m_inv, 0.0));
-        });
-    });
-
-    // Gershgorin reduction + initial b copy + b-norm reduction in parallel-friendly order
-    double gersh_max_host = 0.0;
-    double bnorm_host = 0.0;
-    {
-        sycl::buffer<double> gersh_buf{&gersh_max_host, sycl::range<1>(1)};
-        sycl::buffer<double> bnorm_buf{&bnorm_host, sycl::range<1>(1)};
-        gersh_buf.set_final_data(nullptr);
-        bnorm_buf.set_final_data(nullptr);
-
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor g(gersh_buf, h, sycl::write_only, sycl::no_init);
-            sycl::accessor bn(bnorm_buf, h, sycl::write_only, sycl::no_init);
-            h.single_task([=]() { g[0] = 0.0; bn[0] = 0.0; });
-        });
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor src(b_buf, h, sycl::read_only);
-            sycl::accessor dst(x_buf, h, sycl::write_only, sycl::no_init);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { dst[i] = src[i]; });
-        });
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor in(row_score_buf, h, sycl::read_only);
-            auto red = sycl::reduction(gersh_buf, h, sycl::maximum<double>());
-            h.parallel_for(sycl::range<1>(n), red, [=](sycl::id<1> i, auto& m) { m.combine(in[i]); });
-        });
-        scalar_product_parallel(q, x_buf, x_buf, bnorm_buf, n);
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor a(gersh_buf, h, sycl::read_only);
-            h.copy(a, &gersh_max_host);
-        });
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor a(bnorm_buf, h, sycl::read_only);
-            h.copy(a, &bnorm_host);
-        }).wait_and_throw();
-    }
-
-    if (bnorm_host < 1e-20) {
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor x(x_buf, h, sycl::write_only, sycl::no_init);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { x[i] = 1.0; });
-        });
-        bnorm_host = static_cast<double>(n);
-    }
-    {
-        const double inv_bnorm = 1.0 / std::sqrt(bnorm_host);
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor x(x_buf, h, sycl::read_write);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { x[i] *= inv_bnorm; });
-        });
-    }
-
-    // Power iteration on B = D^-1/2 A D^-1/2
-    double lambda_max_estimate = 0.0;
-    for (size_t iter = 0; iter < power_iterations; ++iter) {
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor sm(sqrt_minv_buf, h, sycl::read_only);
-            sycl::accessor x(x_buf, h, sycl::read_only);
-            sycl::accessor sx(scaled_buf, h, sycl::write_only, sycl::no_init);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { sx[i] = sm[i] * x[i]; });
-        });
-        CSR_mat_vec_prod_parallel(q, scaled_buf, row_ptr_buf, col_ind_buf, val_buf, y_buf, n);
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor sm(sqrt_minv_buf, h, sycl::read_only);
-            sycl::accessor y(y_buf, h, sycl::read_only);
-            sycl::accessor sx(scaled_buf, h, sycl::write_only, sycl::no_init);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { sx[i] = sm[i] * y[i]; });
-        });
-
-        double rayleigh_host = 0.0;
-        double ynorm_host = 0.0;
-        {
-            sycl::buffer<double> ray_buf{&rayleigh_host, sycl::range<1>(1)};
-            sycl::buffer<double> ynorm_buf{&ynorm_host, sycl::range<1>(1)};
-            ray_buf.set_final_data(nullptr);
-            ynorm_buf.set_final_data(nullptr);
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor a(ray_buf, h, sycl::write_only, sycl::no_init);
-                sycl::accessor b2(ynorm_buf, h, sycl::write_only, sycl::no_init);
-                h.single_task([=]() { a[0] = 0.0; b2[0] = 0.0; });
-            });
-            scalar_product_parallel(q, x_buf, scaled_buf, ray_buf, n);
-            scalar_product_parallel(q, scaled_buf, scaled_buf, ynorm_buf, n);
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor a(ray_buf, h, sycl::read_only);
-                h.copy(a, &rayleigh_host);
-            });
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor a(ynorm_buf, h, sycl::read_only);
-                h.copy(a, &ynorm_host);
-            }).wait_and_throw();
-        }
-
-        if (rayleigh_host > lambda_max_estimate) {
-            lambda_max_estimate = rayleigh_host;
-        }
-        if (ynorm_host < 1e-30) {
-            break;
-        }
-        const double inv_y = 1.0 / std::sqrt(ynorm_host);
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor sx(scaled_buf, h, sycl::read_only);
-            sycl::accessor x(x_buf, h, sycl::write_only, sycl::no_init);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { x[i] = sx[i] * inv_y; });
-        });
-    }
-
-    // Lambda_min: fast Rayleigh with rhs = b on operator M_inv * A
-    double lambda_min_estimate = 0.0;
-    {
-        q.submit([&](sycl::handler& h) {
-            sycl::accessor src(b_buf, h, sycl::read_only);
-            sycl::accessor dst(x_buf, h, sycl::write_only, sycl::no_init);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { dst[i] = src[i]; });
-        });
-
-        double pnorm_host = 0.0;
-        {
-            sycl::buffer<double> pnorm_buf{&pnorm_host, sycl::range<1>(1)};
-            pnorm_buf.set_final_data(nullptr);
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor a(pnorm_buf, h, sycl::write_only, sycl::no_init);
-                h.single_task([=]() { a[0] = 0.0; });
-            });
-            scalar_product_parallel(q, x_buf, x_buf, pnorm_buf, n);
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor a(pnorm_buf, h, sycl::read_only);
-                h.copy(a, &pnorm_host);
-            }).wait_and_throw();
-        }
-        if (pnorm_host < 1e-20) {
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor x(x_buf, h, sycl::write_only, sycl::no_init);
-                h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { x[i] = 1.0; });
-            });
-            pnorm_host = static_cast<double>(n);
-        }
-        CSR_mat_vec_prod_parallel(q, x_buf, row_ptr_buf, col_ind_buf, val_buf, y_buf, n);
-
-        double ray_host = 0.0;
-        {
-            sycl::buffer<double> ray_buf{&ray_host, sycl::range<1>(1)};
-            ray_buf.set_final_data(nullptr);
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor a(ray_buf, h, sycl::write_only, sycl::no_init);
-                h.single_task([=]() { a[0] = 0.0; });
-            });
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor probe(x_buf, h, sycl::read_only);
-                sycl::accessor M_inv(M_inv_buf, h, sycl::read_only);
-                sycl::accessor y(y_buf, h, sycl::read_only);
-                auto red = sycl::reduction(ray_buf, h, sycl::plus<double>());
-                h.parallel_for(sycl::range<1>(n), red, [=](sycl::id<1> i, auto& s) {
-                    s += probe[i] * M_inv[i] * y[i];
-                });
-            });
-            q.submit([&](sycl::handler& h) {
-                sycl::accessor a(ray_buf, h, sycl::read_only);
-                h.copy(a, &ray_host);
-            }).wait_and_throw();
-        }
-        lambda_min_estimate = (pnorm_host > 1e-30) ? (ray_host / pnorm_host) : lambda_max_estimate;
-        lambda_min_estimate = std::clamp(lambda_min_estimate, 1e-14, 0.999999 * std::max(gersh_max_host, 1e-14));
-    }
-
-    const double lambda_max_bound = (n < 20000)
-        ? gersh_max_host
-        : std::clamp(
-            std::max(power_safety * lambda_max_estimate, 1.0001 * lambda_min_estimate),
-            1.0001 * lambda_min_estimate,
-            std::max(gersh_max_host, 1.0001 * lambda_min_estimate));
-    const double lambda_min_bound = std::clamp(lambda_min_estimate, 1e-14, 0.999999 * lambda_max_bound);
-
-    *out_lambda_min = lambda_min_bound;
-    *out_lambda_max = lambda_max_bound;
-}
-
-unsigned int CG_SYCL_chebyshev(CSR_matrix<double>& mat,
-                               std::vector<double>& x,
-                               std::vector<double>& b,
-                               sycl::queue& q,
-                               size_t degree,
-                               size_t* used_degree)
-{
-    double b_norm = scalar_product(b, b);
-    if (b_norm < 1e-10) {
-        if (used_degree != nullptr) {
-            *used_degree = 0;
-        }
-        std::fill(x.begin(), x.end(), 0.0);
-        return 0;
-    }
-
-    auto& row_ptr = mat.row_ptr_ref();
-    auto& col_ind = mat.col_ind_ref();
-    auto& val = mat.val_ref();
-    const size_t n = row_ptr.size() - 1;
-    std::vector<double> r = b;
-    std::vector<double> Ap(n), z(n), p(n);
-
-    auto setup_start = std::chrono::high_resolution_clock::now();
-
-    const bool on_gpu = q.get_device().is_gpu();
-    const size_t power_iterations = (n >= 100000) ? 6 : ((n >= 50000) ? 8 : 12);
-    const double power_safety = (n >= 100000) ? 1.35 : ((n >= 50000) ? 1.25 : 1.10);
-
-    // M_inv lives device-only on GPU (no host backing) and host-backed on CPU.
-    std::vector<double> M_inv;
-    std::unique_ptr<sycl::buffer<double>> M_inv_buf_ptr;
-    double lambda_min_bound = 0.0;
-    double lambda_max_bound = 0.0;
-
-    // GPU path uses 32-bit indices (saves SpMV bandwidth); CPU path keeps 64-bit.
-    std::unique_ptr<sycl::buffer<uint32_t>> row_ptr_u32_buf_ptr;
-    std::unique_ptr<sycl::buffer<uint32_t>> col_ind_u32_buf_ptr;
-    std::unique_ptr<sycl::buffer<size_t>> row_ptr_buf_ptr;
-    std::unique_ptr<sycl::buffer<size_t>> col_ind_buf_ptr;
-    sycl::buffer<double> val_buf{val.data(), sycl::range<1>(val.size())};
-
-    if (on_gpu) {
-        auto& row_ptr_u32 = mat.row_ptr_u32_ref();
-        auto& col_ind_u32 = mat.col_ind_u32_ref();
-        row_ptr_u32_buf_ptr = std::make_unique<sycl::buffer<uint32_t>>(row_ptr_u32.data(), sycl::range<1>(row_ptr_u32.size()));
-        col_ind_u32_buf_ptr = std::make_unique<sycl::buffer<uint32_t>>(col_ind_u32.data(), sycl::range<1>(col_ind_u32.size()));
-        row_ptr_u32_buf_ptr->set_final_data(nullptr);
-        col_ind_u32_buf_ptr->set_final_data(nullptr);
-
-        M_inv_buf_ptr = std::make_unique<sycl::buffer<double>>(sycl::range<1>(n));
-        M_inv_buf_ptr->set_final_data(nullptr);
-        chebyshev_setup_device(q, *row_ptr_u32_buf_ptr, *col_ind_u32_buf_ptr, val_buf, b,
-                               *M_inv_buf_ptr, n, power_iterations, power_safety,
-                               &lambda_min_bound, &lambda_max_bound);
-    }
-    else {
-        row_ptr_buf_ptr = std::make_unique<sycl::buffer<size_t>>(row_ptr.data(), sycl::range<1>(row_ptr.size()));
-        col_ind_buf_ptr = std::make_unique<sycl::buffer<size_t>>(col_ind.data(), sycl::range<1>(col_ind.size()));
-        std::vector<size_t> diag_pos;
-        build_diag_positions(row_ptr, col_ind, diag_pos);
-        const double gershgorin_lambda_max =
-            build_jacobi_inverse_and_gershgorin_bound_local(row_ptr, diag_pos, val, M_inv);
-        const double power_lambda_max =
-            estimate_scaled_lambda_max_power_local(row_ptr, col_ind, val, M_inv, b, power_iterations);
-        const double lambda_min_raw =
-            estimate_chebyshev_lambda_min_scaled_fast_local(row_ptr, col_ind, val, M_inv, b, gershgorin_lambda_max);
-        lambda_max_bound = (n < 20000)
-            ? gershgorin_lambda_max
-            : std::clamp(
-                std::max(power_safety * power_lambda_max, 1.0001 * lambda_min_raw),
-                1.0001 * lambda_min_raw,
-                std::max(gershgorin_lambda_max, 1.0001 * lambda_min_raw));
-        lambda_min_bound = lambda_min_raw;
-        if (n >= 50000) {
-            const double lambda_min_refined = refine_chebyshev_lambda_min_scaled_local(
-                row_ptr, col_ind, val, M_inv, b, lambda_min_raw, lambda_max_bound, degree);
-            if (n >= 500000) {
-                lambda_min_bound = std::clamp(
-                    0.25 * lambda_min_raw + 0.75 * lambda_min_refined,
-                    0.45 * lambda_min_raw,
-                    lambda_min_raw);
-            }
-            else {
-                lambda_min_bound = std::clamp(
-                    0.5 * lambda_min_raw + 0.5 * lambda_min_refined,
-                    0.45 * lambda_min_raw,
-                    lambda_min_raw);
-            }
-        }
-        M_inv_buf_ptr = std::make_unique<sycl::buffer<double>>(M_inv.data(), sycl::range<1>(n));
-        M_inv_buf_ptr->set_final_data(nullptr);
-    }
-
-    const size_t active_degree = std::max<size_t>(1, degree);
-    if (used_degree != nullptr) {
-        *used_degree = active_degree;
-    }
-
-    std::vector<double> chebyshev_steps;
-    build_chebyshev_steps(lambda_min_bound, lambda_max_bound, active_degree, chebyshev_steps);
-    const bool has_chebyshev_steps = !chebyshev_steps.empty();
-    const double first_tau = has_chebyshev_steps ? chebyshev_steps.front() : 1.0;
-
-    {
-        auto setup_end = std::chrono::high_resolution_clock::now();
-        double setup_ms = std::chrono::duration<double, std::milli>(setup_end - setup_start).count();
-        std::cout << "Chebyshev setup [" << (on_gpu ? "GPU" : "CPU") << "]: " << setup_ms << " ms" << std::endl;
-    }
-
-    sycl::buffer<double> r_buf{r.data(), sycl::range<1>(n)};
-    sycl::buffer<double> z_buf{z.data(), sycl::range<1>(n)};
-    sycl::buffer<double> p_buf{p.data(), sycl::range<1>(n)};
-    sycl::buffer<double> x_buf{x.data(), sycl::range<1>(n)};
-    sycl::buffer<double> Ap_buf{Ap.data(), sycl::range<1>(n)};
-    std::vector<double> t(n, 0.0);
-    sycl::buffer<double> t_buf{t.data(), sycl::range<1>(n)};
-    sycl::buffer<double>& M_inv_buf = *M_inv_buf_ptr;
-
-    r_buf.set_final_data(nullptr);
-    z_buf.set_final_data(nullptr);
-    p_buf.set_final_data(nullptr);
-    x_buf.set_final_data(nullptr);
-    Ap_buf.set_final_data(nullptr);
-    t_buf.set_final_data(nullptr);
-    M_inv_buf.set_final_data(nullptr);
-
-    std::cout << "Chebyshev degree: " << active_degree << std::endl;
-
-    // Dispatch SpMV / Chebyshev apply to whichever index width is in use.
-    auto spmv_p_to_Ap = [&]() {
-        if (on_gpu) {
-            CSR_mat_vec_prod_parallel(q, p_buf, *row_ptr_u32_buf_ptr, *col_ind_u32_buf_ptr, val_buf, Ap_buf, n);
-        } else {
-            CSR_mat_vec_prod_parallel(q, p_buf, *row_ptr_buf_ptr, *col_ind_buf_ptr, val_buf, Ap_buf, n);
-        }
-    };
-    auto cheb_apply = [&](bool init_from_r) {
-        if (on_gpu) {
-            apply_chebyshev_preconditioner_device(q,
-                *row_ptr_u32_buf_ptr, *col_ind_u32_buf_ptr, val_buf, M_inv_buf,
-                r_buf, t_buf, Ap_buf, z_buf, n, chebyshev_steps, init_from_r);
-        } else {
-            apply_chebyshev_preconditioner_device(q,
-                *row_ptr_buf_ptr, *col_ind_buf_ptr, val_buf, M_inv_buf,
-                r_buf, t_buf, Ap_buf, z_buf, n, chebyshev_steps, init_from_r);
-        }
-    };
-
-    cheb_apply(true);
-
-    q.submit([&](sycl::handler& h) {
-        auto z_acc = z_buf.get_access<sycl::access::mode::read>(h);
-        auto p_acc = p_buf.get_access<sycl::access::mode::write>(h);
-        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { p_acc[i] = z_acc[i]; });
-    });
-
-    double old_rr = 0.0, new_rr = 0.0, pAp = 0.0, alpha = 0.0, beta = 0.0;
-    sycl::buffer<double> old_rr_buf{&old_rr, sycl::range<1>(1)};
-    sycl::buffer<double> new_rr_buf{&new_rr, sycl::range<1>(1)};
-    sycl::buffer<double> pAp_buf{&pAp, sycl::range<1>(1)};
-    sycl::buffer<double> alpha_buf{&alpha, sycl::range<1>(1)};
-    sycl::buffer<double> beta_buf{&beta, sycl::range<1>(1)};
-
-    old_rr_buf.set_final_data(nullptr);
-    new_rr_buf.set_final_data(nullptr);
-    pAp_buf.set_final_data(nullptr);
-    alpha_buf.set_final_data(nullptr);
-    beta_buf.set_final_data(nullptr);
-
-    scalar_product_parallel(q, r_buf, z_buf, old_rr_buf, n);
-
-    unsigned int iteration = 0;
-    unsigned int max_iter = static_cast<unsigned int>(n);
-    // Only sync to host every CHECK_STRIDE iterations to avoid stalling the GPU pipeline.
-    // Chebyshev typically needs many CG iterations, so amortizing host sync is a big win.
-    constexpr unsigned int CHECK_STRIDE = 8;
-
-    do {
-        iteration++;
-        spmv_p_to_Ap();
-        scalar_product_parallel(q, p_buf, Ap_buf, pAp_buf, n);
-
-        q.submit([&](sycl::handler& h) {
-            auto old_rr_acc = old_rr_buf.get_access<sycl::access::mode::read>(h);
-            auto pAp_acc = pAp_buf.get_access<sycl::access::mode::read_write>(h);
-            auto alpha_acc = alpha_buf.get_access<sycl::access::mode::write>(h);
-            auto new_rr_acc = new_rr_buf.get_access<sycl::access::mode::write>(h);
-            h.single_task([=]() {
-                alpha_acc[0] = (std::abs(pAp_acc[0]) > 1e-30) ? old_rr_acc[0] / pAp_acc[0] : 0.0;
-                new_rr_acc[0] = 0.0;
-                pAp_acc[0] = 0.0;
-            });
-        });
-
-        q.submit([&](sycl::handler& h) {
-            auto x_acc = x_buf.get_access<sycl::access::mode::read_write>(h);
-            auto r_acc = r_buf.get_access<sycl::access::mode::read_write>(h);
-            auto p_acc = p_buf.get_access<sycl::access::mode::read>(h);
-            auto Ap_acc = Ap_buf.get_access<sycl::access::mode::read>(h);
-            auto alpha_acc = alpha_buf.get_access<sycl::access::mode::read>(h);
-            auto M_inv_acc = M_inv_buf.get_access<sycl::access::mode::read>(h);
-            auto t_acc = t_buf.get_access<sycl::access::mode::write>(h);
-            auto z_acc = z_buf.get_access<sycl::access::mode::write>(h);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-                x_acc[i] += alpha_acc[0] * p_acc[i];
-                const double residual = r_acc[i] - alpha_acc[0] * Ap_acc[i];
-                r_acc[i] = residual;
-                if (has_chebyshev_steps) {
-                    t_acc[i] = residual;
-                    z_acc[i] = first_tau * M_inv_acc[i] * residual;
-                }
-            });
-        });
-
-        if (has_chebyshev_steps) {
-            cheb_apply(false);
-        }
-        else {
-            apply_diagonal_preconditioner(q, M_inv_buf, r_buf, z_buf, n);
-        }
-        scalar_product_parallel(q, r_buf, z_buf, new_rr_buf, n);
-
-        const bool should_check = (iteration % CHECK_STRIDE == 0) || (iteration == max_iter);
-        if (should_check) {
-            q.submit([&](sycl::handler& h) {
-                auto acc = new_rr_buf.get_access<sycl::access::mode::read>(h);
-                h.copy(acc, &new_rr);
-            }).wait_and_throw();
-
-            if (new_rr / b_norm < eps * eps || iteration == max_iter) {
-                break;
-            }
-        }
-
-        q.submit([&](sycl::handler& h) {
-            auto old_rr_acc = old_rr_buf.get_access<sycl::access::mode::read_write>(h);
-            auto new_rr_acc = new_rr_buf.get_access<sycl::access::mode::read>(h);
-            auto beta_acc = beta_buf.get_access<sycl::access::mode::write>(h);
-            h.single_task([=]() {
-                beta_acc[0] = (std::abs(old_rr_acc[0]) > 1e-30) ? new_rr_acc[0] / old_rr_acc[0] : 0.0;
-                old_rr_acc[0] = new_rr_acc[0];
-            });
-        });
-        q.submit([&](sycl::handler& h) {
-            auto p_acc = p_buf.get_access<sycl::access::mode::read_write>(h);
-            auto z_acc = z_buf.get_access<sycl::access::mode::read>(h);
-            auto beta_acc = beta_buf.get_access<sycl::access::mode::read>(h);
-            h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-                p_acc[i] = z_acc[i] + beta_acc[0] * p_acc[i];
-            });
-        });
-    } while (iteration < max_iter);
-
-    q.submit([&](sycl::handler& h) {
-        auto acc = x_buf.get_access<sycl::access::mode::read>(h);
-        h.copy(acc, x.data());
-    }).wait_and_throw();
-    std::cout << "CG-Chebyshev iterations: " << iteration << std::endl;
-    return iteration;
-}
 
 // ---------------- Adaptive Chebyshev (Lanczos-derived bounds) -------------------
 

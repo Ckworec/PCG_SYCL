@@ -1,14 +1,9 @@
 #include "func.h"
 #include <array>
+#include <atomic>
+#include <cstdint>
 
 using namespace sycl;
-
-// Forward declarations (needed for SYCL adaptation path).
-static double zhukov_refine_lambda_min_from_delta(double delta,
-                                                  double lambda_min_star,
-                                                  double lambda_max_star,
-                                                  size_t degree);
-static size_t chebyshev_degree_for_accuracy(double eps1, double eta);
 
 void compute_jacobi_preconditioner_buf(buffer<size_t>& row_ptr_buf,
                                        buffer<size_t>& diag_pos_buf,
@@ -588,253 +583,6 @@ void apply_block_jacobi_preconditioner(sycl::queue& q,
     });
 }
 
-void compute_spai_preconditioner_buf(buffer<size_t>& row_ptr_buf,
-                                     buffer<size_t>& diag_pos_buf,
-                                     buffer<double>& val_buf,
-                                     buffer<double>& M_inv_buf,
-                                     size_t n,
-                                     sycl::queue& q)
-{
-    q.submit([&](handler& h) {
-        accessor row_ptr_acc(row_ptr_buf, h, read_only);
-        accessor diag_pos_acc(diag_pos_buf, h, read_only);
-        accessor val_acc(val_buf, h, read_only);
-        accessor M_acc(M_inv_buf, h, write_only, no_init);
-
-        h.parallel_for(range<1>(n), [=](id<1> i) {
-            const double diag = val_acc[diag_pos_acc[i]];
-            double row_sq_sum = 0.0;
-            for (size_t k = row_ptr_acc[i]; k < row_ptr_acc[i + 1]; ++k) {
-                const double a_ik = val_acc[k];
-                row_sq_sum += a_ik * a_ik;
-            }
-
-            if (std::abs(diag) > 1e-14 && row_sq_sum > 1e-28) {
-                M_acc[i] = diag / row_sq_sum;
-            } else {
-                M_acc[i] = 0.0;
-            }
-        });
-    });
-}
-
-// Fused variant: finds the diagonal entry inline in one pass, removing the
-// host-side build_diag_positions() step plus one device buffer.
-void compute_spai_preconditioner_inline_buf(buffer<size_t>& row_ptr_buf,
-                                            buffer<size_t>& col_ind_buf,
-                                            buffer<double>& val_buf,
-                                            buffer<double>& M_inv_buf,
-                                            size_t n,
-                                            sycl::queue& q)
-{
-    q.submit([&](handler& h) {
-        accessor row_ptr_acc(row_ptr_buf, h, read_only);
-        accessor col_ind_acc(col_ind_buf, h, read_only);
-        accessor val_acc(val_buf, h, read_only);
-        accessor M_acc(M_inv_buf, h, write_only, no_init);
-
-        h.parallel_for(range<1>(n), [=](id<1> i) {
-            const size_t row = i[0];
-            const size_t begin = row_ptr_acc[row];
-            const size_t end = row_ptr_acc[row + 1];
-            double row_sq_sum = 0.0;
-            double diag = 0.0;
-            for (size_t k = begin; k < end; ++k) {
-                const double a_ik = val_acc[k];
-                row_sq_sum += a_ik * a_ik;
-                if (col_ind_acc[k] == row) {
-                    diag = a_ik;
-                }
-            }
-
-            if (sycl::fabs(diag) > 1e-14 && row_sq_sum > 1e-28) {
-                M_acc[row] = diag / row_sq_sum;
-            } else {
-                M_acc[row] = 0.0;
-            }
-        });
-    });
-}
-
-static double vector_norm_sq_host(const std::vector<double>& x)
-{
-    return parallel_sum_host<double>(0, x.size(), 16384, 0.0, [&](size_t i) {
-        return x[i] * x[i];
-    });
-}
-
-static void csr_mat_vec_prod_host_local(const std::vector<size_t>& row_ptr,
-                                        const std::vector<size_t>& col_ind,
-                                        const std::vector<double>& vals,
-                                        const std::vector<double>& x,
-                                        std::vector<double>& y)
-{
-    const size_t n = x.size();
-    y.resize(n);
-    parallel_for_host(0, n, 16384, [&](size_t i) {
-        double sum = 0.0;
-        for (size_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
-            sum += vals[k] * x[col_ind[k]];
-        }
-        y[i] = sum;
-    });
-}
-
-void estimate_gershgorin_upper_bound_device(sycl::queue& q,
-                                            sycl::buffer<size_t>& row_ptr_buf,
-                                            sycl::buffer<double>& val_buf,
-                                            sycl::buffer<double>& row_sums_buf,
-                                            sycl::buffer<double>& lambda_max_buf,
-                                            size_t n)
-{
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor row_ptr(row_ptr_buf, h, sycl::read_only);
-        sycl::accessor val(val_buf, h, sycl::read_only);
-        sycl::accessor out(row_sums_buf, h, sycl::write_only, sycl::no_init);
-        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-            double s = 0.0;
-            for (size_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
-                s += sycl::fabs(val[k]);
-            }
-            out[i] = s;
-        });
-    });
-
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor lambda_max(lambda_max_buf, h, sycl::write_only, sycl::no_init);
-        h.single_task([=]() {
-            lambda_max[0] = 0.0;
-        });
-    });
-
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor in(row_sums_buf, h, sycl::read_only);
-        auto red = sycl::reduction(lambda_max_buf, h, sycl::maximum<double>());
-        h.parallel_for(sycl::range<1>(n), red, [=](sycl::id<1> i, auto& m) {
-            m.combine(in[i]);
-        });
-    });
-}
-
-void estimate_chebyshev_lambda_min_device(sycl::queue& q,
-                                          sycl::buffer<size_t>& row_ptr_buf,
-                                          sycl::buffer<size_t>& col_ind_buf,
-                                          sycl::buffer<double>& val_buf,
-                                          sycl::buffer<double>& rhs_buf,
-                                          sycl::buffer<double>& probe_buf,
-                                          sycl::buffer<double>& Ap_buf,
-                                          sycl::buffer<double>& norm_buf,
-                                          sycl::buffer<double>& rayleigh_buf,
-                                          sycl::buffer<double>& lambda_max_buf,
-                                          sycl::buffer<double>& lambda_min_buf,
-                                          size_t n)
-{
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor rhs(rhs_buf, h, sycl::read_only);
-        sycl::accessor probe(probe_buf, h, sycl::write_only, sycl::no_init);
-        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-            probe[i] = rhs[i];
-        });
-    });
-
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor norm(norm_buf, h, sycl::write_only, sycl::no_init);
-        h.single_task([=]() {
-            norm[0] = 0.0;
-        });
-    });
-    
-    scalar_product_parallel(q, probe_buf, probe_buf, norm_buf, n);
-
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor norm(norm_buf, h, sycl::read_only);
-        sycl::accessor probe(probe_buf, h, sycl::read_write);
-        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
-            if (norm[0] < 1e-20) {
-                probe[i] = 1.0;
-            }
-        });
-    });
-
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor norm(norm_buf, h, sycl::write_only, sycl::no_init);
-        sycl::accessor rayleigh(rayleigh_buf, h, sycl::write_only, sycl::no_init);
-        h.single_task([=]() {
-            norm[0] = 0.0;
-            rayleigh[0] = 0.0;
-        });
-    });
-
-    scalar_product_parallel(q, probe_buf, probe_buf, norm_buf, n);
-    CSR_mat_vec_prod_parallel(q, probe_buf, row_ptr_buf, col_ind_buf, val_buf, Ap_buf, n);
-    scalar_product_parallel(q, Ap_buf, probe_buf, rayleigh_buf, n);
-
-    q.submit([&](sycl::handler& h) {
-        sycl::accessor norm(norm_buf, h, sycl::read_only);
-        sycl::accessor rayleigh(rayleigh_buf, h, sycl::read_only);
-        sycl::accessor lambda_max(lambda_max_buf, h, sycl::read_only);
-        sycl::accessor lambda_min(lambda_min_buf, h, sycl::write_only, sycl::no_init);
-        h.single_task([=]() {
-            const double lambda_max_value = lambda_max[0];
-            if (lambda_max_value <= 1e-14) {
-                lambda_min[0] = std::max(1e-14, 1e-6 * lambda_max_value);
-                return;
-            }
-
-            const double denom = sycl::fmax(norm[0], 1e-30);
-            double lambda_min_value = rayleigh[0] / denom;
-            lambda_min_value = sycl::fmax(lambda_min_value, 1e-14);
-            lambda_min_value = sycl::fmin(lambda_min_value, 0.999999 * lambda_max_value);
-            lambda_min[0] = lambda_min_value;
-        });
-    });
-}
-
-// Оператор F_p(A) = ∏_k (I - τ_k A) из препринта ИПМ 2018-172, (3); нужен для δ = ||F_p(A)v||/||v||.
-static void apply_chebyshev_operator_product_host(const std::vector<size_t>& row_ptr,
-                                                  const std::vector<size_t>& col_ind,
-                                                  const std::vector<double>& vals,
-                                                  const std::vector<double>& r,
-                                                  std::vector<double>& t,
-                                                  std::vector<double>& w,
-                                                  const std::vector<double>& steps)
-{
-    const size_t n = r.size();
-    t = r;
-
-    for (double tau : steps) {
-        csr_mat_vec_prod_host_local(row_ptr, col_ind, vals, t, w);
-
-        for (size_t i = 0; i < n; ++i) {
-            t[i] -= tau * w[i];
-        }
-    }
-}
-
-// Предобуславливатель в CG: прежняя (стабильная в расчётах) схема накопления.
-static void apply_chebyshev_host(const std::vector<size_t>& row_ptr,
-                                 const std::vector<size_t>& col_ind,
-                                 const std::vector<double>& vals,
-                                 const std::vector<double>& r,
-                                 std::vector<double>& z,
-                                 std::vector<double>& t,
-                                 std::vector<double>& w,
-                                 const std::vector<double>& steps)
-{
-    const size_t n = r.size();
-    t = r;
-    z.assign(n, 0.0);
-
-    for (double tau : steps) {
-        csr_mat_vec_prod_host_local(row_ptr, col_ind, vals, t, w);
-
-        parallel_for_host(0, n, 512, [&](size_t i) {
-            const double current_t = t[i];
-            z[i] += tau * current_t;
-            t[i] = current_t - tau * w[i];
-        });
-    }
-}
 
 // Упорядочивание параметров τ (устойчивость по Лебедеву–Финогенову): чередование «с краёв».
 static void permute_chebyshev_tau_order(size_t degree, std::vector<double>& tau)
@@ -875,55 +623,6 @@ void build_chebyshev_steps(double lambda_min_estimate,
     permute_chebyshev_tau_order(degree, steps);
 }
 
-// Формула (9) препринта 2018-172: число итераций Чебышёва для достижения точности eps1
-// при η = λ*_min / λ*_max. Используется только для адаптации (не для предобуславливателя CG).
-static size_t chebyshev_degree_for_accuracy(double eps1, double eta)
-{
-    eta = std::clamp(eta, 1e-12, 0.999999);
-    const double sqrt_eta = std::sqrt(eta);
-    // ln((1+√η)/(1-√η))
-    const double log_rho = std::log((1.0 + sqrt_eta) / (1.0 - sqrt_eta));
-    if (log_rho < 1e-20) return 200;
-    eps1 = std::clamp(eps1, 1e-15, 0.999);
-    const double inv_eps = 1.0 / eps1;
-    // ln(ε⁻¹ + √(ε⁻² - 1))
-    const double numer = std::log(inv_eps + std::sqrt(inv_eps * inv_eps - 1.0));
-    const size_t p = static_cast<size_t>(std::ceil(numer / log_rho));
-    return std::clamp(p, size_t(1), size_t(200));
-}
-
-// Препринт ИПМ 2018-172 (Жуков, Новикова, Феодоритова), п.4: уточнение λ*_min по δ = ||r_p||/||r_0|| и формулы (6).
-static double zhukov_refine_lambda_min_from_delta(double delta,
-                                                double lambda_min_star,
-                                                double lambda_max_star,
-                                                size_t degree)
-{
-    if (!std::isfinite(delta) || degree == 0) {
-        return lambda_min_star;
-    }
-
-    double eta = std::clamp(lambda_min_star / lambda_max_star, 1e-30, 0.999999);
-    const double sqrt_eta = std::sqrt(eta);
-    const double rho = (1.0 - sqrt_eta) / std::max(1e-30, 1.0 + sqrt_eta);
-    const double p = static_cast<double>(degree);
-    const double qp = 2.0 / (std::pow(rho, p) + std::pow(rho, -p));
-    const double y1 = delta / std::max(qp, 1e-300);
-
-    if (y1 <= 1.0) {
-        return lambda_min_star;
-    }
-
-    const double x_star = std::cosh(std::acosh(y1) / p);
-    double lambda_new = lambda_max_star * (0.5 * (1.0 + eta) - 0.5 * (1.0 - eta) * x_star);
-
-    if (!std::isfinite(lambda_new)) {
-        return lambda_min_star;
-    }
-
-    const double upper =
-        std::min(0.999999 * lambda_max_star, std::max(2e-14, 0.999999 * lambda_min_star));
-    return std::clamp(lambda_new, 1e-14, upper);
-}
 
 void apply_chebyshev_preconditioner_device(sycl::queue& q,
                                            sycl::buffer<size_t>& row_ptr_buf,
@@ -1068,256 +767,40 @@ void apply_chebyshev_preconditioner_device(sycl::queue& q,
     }
 }
 
-template <typename Func>
-static void parallel_for_chunks(size_t begin, size_t end, Func&& fn)
-{
-    if (end <= begin) {
-        return;
-    }
-
-    const size_t work_size = end - begin;
-    const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
-    const size_t thread_count = std::min<size_t>(hw_threads, work_size);
-
-    if (thread_count <= 1 || work_size < 256) {
-        for (size_t idx = begin; idx < end; ++idx) {
-            fn(idx);
-        }
-        return;
-    }
-
-    const size_t chunk = (work_size + thread_count - 1) / thread_count;
-    std::vector<std::thread> workers;
-    workers.reserve(thread_count);
-
-    for (size_t thread_id = 0; thread_id < thread_count; ++thread_id) {
-        const size_t chunk_begin = begin + thread_id * chunk;
-        const size_t chunk_end = std::min(end, chunk_begin + chunk);
-        if (chunk_begin >= chunk_end) {
-            continue;
-        }
-
-        workers.emplace_back([chunk_begin, chunk_end, &fn]() {
-            for (size_t idx = chunk_begin; idx < chunk_end; ++idx) {
-                fn(idx);
-            }
-        });
-    }
-
-    for (auto& worker : workers) {
-        worker.join();
-    }
-}
-
-static void build_level_schedule(const std::vector<size_t>& levels,
-                                 std::vector<size_t>& level_ptr,
-                                 std::vector<size_t>& rows)
-{
-    const size_t n = levels.size();
-    const size_t max_level = levels.empty() ? 0 : *std::max_element(levels.begin(), levels.end());
-
-    level_ptr.assign(max_level + 2, 0);
-    for (size_t level : levels) {
-        level_ptr[level + 1]++;
-    }
-    for (size_t i = 1; i < level_ptr.size(); ++i) {
-        level_ptr[i] += level_ptr[i - 1];
-    }
-
-    rows.assign(n, 0);
-    std::vector<size_t> offsets = level_ptr;
-    for (size_t row = 0; row < n; ++row) {
-        rows[offsets[levels[row]]++] = row;
-    }
-}
-
-void ic0_factor(size_t n,
-                const std::vector<size_t>& row_ptr,
-                const std::vector<size_t>& col_idx,
-                const std::vector<double>& vals,
-                IC0Preconditioner& ic0)
-{
-    const size_t not_found = size_t(-1);
-    const double relative_shift = 1e-1;
-    const double absolute_shift = 1e-14;
-    ic0.row_ptr = row_ptr;
-    ic0.col_idx = col_idx;
-    ic0.perm.resize(n);
-    ic0.inv_perm.resize(n);
-    for (size_t i = 0; i < n; ++i) {
-        ic0.perm[i] = i;
-        ic0.inv_perm[i] = i;
-    }
-
-    ic0.L_vals.assign(vals.size(), 0.0);
-    ic0.diag.assign(n, 0.0);
-    ic0.diag_pos.assign(n, not_found);
-
-    std::vector<size_t> forward_levels(n, 0);
-
-    for (size_t i = 0; i < n; ++i) {
-        size_t level = 0;
-        for (size_t idx = row_ptr[i]; idx < row_ptr[i + 1]; ++idx) {
-            const size_t col = col_idx[idx];
-            if (col == i) {
-                ic0.diag_pos[i] = idx;
-                break;
-            }
-            if (col < i) {
-                level = std::max(level, forward_levels[col] + 1);
-            }
-        }
-
-        if (ic0.diag_pos[i] == not_found) {
-            throw std::runtime_error("No diagonal in row " + std::to_string(i));
-        }
-
-        if (!(vals[ic0.diag_pos[i]] > 0.0) || !std::isfinite(vals[ic0.diag_pos[i]])) {
-            throw std::runtime_error("IC0 requires positive diagonal at row " + std::to_string(i));
-        }
-
-        forward_levels[i] = level;
-    }
-
-    build_level_schedule(forward_levels, ic0.forward_level_ptr, ic0.forward_rows);
-
-    ic0.upper_ptr.assign(n + 1, 0);
-    for (size_t i = 0; i < n; ++i) {
-        for (size_t idx = row_ptr[i]; idx < ic0.diag_pos[i]; ++idx) {
-            ic0.upper_ptr[col_idx[idx] + 1]++;
-        }
-    }
-    for (size_t i = 1; i < ic0.upper_ptr.size(); ++i) {
-        ic0.upper_ptr[i] += ic0.upper_ptr[i - 1];
-    }
-
-    ic0.upper_row_idx.assign(ic0.upper_ptr.back(), 0);
-    ic0.upper_pos.assign(ic0.upper_ptr.back(), 0);
-    std::vector<size_t> upper_offsets = ic0.upper_ptr;
-    for (size_t row = 0; row < n; ++row) {
-        for (size_t idx = row_ptr[row]; idx < ic0.diag_pos[row]; ++idx) {
-            const size_t col = col_idx[idx];
-            const size_t offset = upper_offsets[col]++;
-            ic0.upper_row_idx[offset] = row;
-            ic0.upper_pos[offset] = idx;
-        }
-    }
-
-    std::vector<size_t> backward_levels(n, 0);
-    for (size_t i = n; i-- > 0;) {
-        size_t level = 0;
-        for (size_t ptr = ic0.upper_ptr[i]; ptr < ic0.upper_ptr[i + 1]; ++ptr) {
-            level = std::max(level, backward_levels[ic0.upper_row_idx[ptr]] + 1);
-        }
-        backward_levels[i] = level;
-    }
-    build_level_schedule(backward_levels, ic0.backward_level_ptr, ic0.backward_rows);
-
-    const size_t forward_level_count = ic0.forward_level_ptr.empty() ? 0 : ic0.forward_level_ptr.size() - 1;
-    for (size_t level = 0; level < forward_level_count; ++level) {
-        const size_t begin = ic0.forward_level_ptr[level];
-        const size_t end = ic0.forward_level_ptr[level + 1];
-        parallel_for_chunks(begin, end, [&](size_t level_index) {
-            const size_t i = ic0.forward_rows[level_index];
-            const size_t diag_index = ic0.diag_pos[i];
-
-            double row_sum_abs = 0.0;
-            for (size_t idx = row_ptr[i]; idx < row_ptr[i + 1]; ++idx) {
-                row_sum_abs += std::abs(vals[idx]);
-            }
-
-            for (size_t idx = row_ptr[i]; idx < diag_index; ++idx) {
-                const size_t j = col_idx[idx];
-                double sum = vals[idx];
-                size_t pi = row_ptr[i];
-                size_t pj = row_ptr[j];
-
-                while (pi < diag_index && pj < ic0.diag_pos[j]) {
-                    const size_t ci = col_idx[pi];
-                    const size_t cj = col_idx[pj];
-
-                    if (ci >= j || cj >= j) {
-                        break;
-                    }
-
-                    if (ci == cj) {
-                        sum -= ic0.L_vals[pi] * ic0.diag[ci] * ic0.L_vals[pj];
-                        ++pi;
-                        ++pj;
-                    }
-                    else if (ci < cj) {
-                        ++pi;
-                    }
-                    else {
-                        ++pj;
-                    }
-                }
-
-                double denom = ic0.diag[j];
-                if (!std::isfinite(denom) || std::abs(denom) < absolute_shift) {
-                    denom = std::max(absolute_shift, relative_shift * std::max(std::abs(vals[ic0.diag_pos[j]]), 1.0));
-                }
-
-                double lij = sum / denom;
-                if (!std::isfinite(lij)) {
-                    lij = 0.0;
-                }
-                ic0.L_vals[idx] = lij;
-            }
-
-            double diag_value = vals[diag_index];
-            for (size_t idx = row_ptr[i]; idx < diag_index; ++idx) {
-                const size_t j = col_idx[idx];
-                diag_value -= ic0.L_vals[idx] * ic0.L_vals[idx] * ic0.diag[j];
-            }
-            diag_value += relative_shift * row_sum_abs;
-
-            const double diag_floor = std::max({
-                absolute_shift,
-                relative_shift * std::max(std::abs(vals[diag_index]), 1.0),
-                relative_shift * std::max(row_sum_abs, 1.0)
-            });
-
-            if (!std::isfinite(diag_value) || diag_value < diag_floor) {
-                diag_value = diag_floor;
-            }
-
-            ic0.diag[i] = diag_value;
-            ic0.L_vals[diag_index] = 1.0;
-        });
-    }
-}
 
 // =====================================================================
-// IC0 application -- new optimised implementation (replaces the old
-// per-level GPU kernel cascade and the old host helpers).
+// IC0 — port of the standalone implementation in
+// ic0_sycl/ic0_cg_sycl.cpp.
 //
-// Two execution flavours, driven by env var IC0_JACOBI_SWEEPS:
-//   * IC0_JACOBI_SWEEPS=0  -> exact level-scheduled triangular solve
-//                             (CPU host only; on GPU we always Jacobi).
-//   * IC0_JACOBI_SWEEPS=N>=1 (default 2) -> N Jacobi sweeps in each
-//                             direction. Each sweep is one bulk
-//                             parallel pass and is dramatically cheaper
-//                             than firing thousands of tiny per-level
-//                             kernels on the GPU.
-//
-// On the CPU we bypass SYCL entirely (per-launch overhead through the
-// CPU OpenCL queue is multiple ms). A persistent thread pool with
-// spin-wait dispatch keeps fork-join cost ~1us instead of the ~50us
-// std::thread spawn cost on Windows.
+//   * ic0_factor                     : level-scheduled diagonal-shifted IC0
+//                                      factorisation (rows inside one level
+//                                      are independent -> host-parallel).
+//   * applyIC0_preconditioner_host   : host apply with two flavours selected
+//                                      by env IC0_JACOBI_SWEEPS:
+//                                          0      -> exact level-scheduled
+//                                                    forward+backward solve
+//                                          N >= 1 -> N Jacobi sweeps in each
+//                                                    direction (default 2)
+//                                      Backed by a persistent worker pool so
+//                                      that fork-join cost on the thousands
+//                                      of small levels is ~1us per dispatch
+//                                      instead of the ~50us std::thread spawn.
+//   * applyIC0_preconditioner_jacobi_device :
+//                                      GPU SYCL Jacobi-sweep apply. Each
+//                                      sweep is one bulk parallel_for over n
+//                                      rows; ns total sweeps in each
+//                                      direction. Collapses ~1300 per-level
+//                                      kernel launches (exact path on GPU)
+//                                      down to ~4 bulk launches per apply.
 // =====================================================================
 
-namespace ic0_apply_detail {
+namespace ic0_detail {
 
-inline int read_jacobi_sweeps_env(int default_sweeps = 2)
-{
-    if (const char* env = std::getenv("IC0_JACOBI_SWEEPS")) {
-        const int v = std::atoi(env);
-        if (v >= 0 && v <= 10) return v;
-    }
-    return default_sweeps;
-}
-
+// Persistent worker pool. Spawning std::threads on Windows costs ~50us,
+// which is way too much when IC0 apply has thousands of small levels and
+// the CG loop fires thousands of fork-joins. With a pool that lives for
+// the entire solve, each dispatch is just a few atomic-store / spin-wait
+// hops (~1-2us) and we keep all cores hot through the whole apply.
 class WorkerPool {
 public:
     explicit WorkerPool(std::size_t nthreads)
@@ -1351,7 +834,7 @@ public:
     {
         if (begin >= end) return;
         const std::size_t work = end - begin;
-        if (work < 256) {
+        if (work < parallel_threshold_) {
             for (std::size_t i = begin; i < end; ++i) fn(i);
             return;
         }
@@ -1369,6 +852,8 @@ public:
             std::this_thread::yield();
         }
     }
+
+    void set_min_parallel_chunk(std::size_t v) { parallel_threshold_ = v; }
 
 private:
     using TrampolineFn = void(*)(void*, std::size_t);
@@ -1405,6 +890,7 @@ private:
     void*                             fn_user_  = nullptr;
     std::size_t                       begin_;
     std::size_t                       end_;
+    std::size_t                       parallel_threshold_ = 256;
 };
 
 inline WorkerPool& worker_pool()
@@ -1413,6 +899,229 @@ inline WorkerPool& worker_pool()
     return pool;
 }
 
+// IC0 produces hundreds of short forward/backward levels (often 1-256 rows
+// each). Creating a fresh std::thread on Windows costs ~50us, so spawning a
+// thread pool per level burns more time than the actual work. Stay serial
+// unless `work` is large enough to amortise the spawn.
+template <typename Func>
+inline void parallel_for_chunks(std::size_t begin, std::size_t end, Func&& fn,
+                                std::size_t min_chunk = 4096)
+{
+    if (end <= begin) return;
+
+    const std::size_t  work = end - begin;
+    if (work < min_chunk) {
+        for (std::size_t idx = begin; idx < end; ++idx) fn(idx);
+        return;
+    }
+
+    const unsigned int hw_threads = std::max(1u, std::thread::hardware_concurrency());
+    const std::size_t  thread_count =
+        std::min<std::size_t>(hw_threads, (work + min_chunk - 1) / min_chunk);
+
+    if (thread_count <= 1) {
+        for (std::size_t idx = begin; idx < end; ++idx) fn(idx);
+        return;
+    }
+
+    const std::size_t chunk = (work + thread_count - 1) / thread_count;
+    std::vector<std::thread> workers;
+    workers.reserve(thread_count);
+    for (std::size_t t = 0; t < thread_count; ++t) {
+        const std::size_t lo = begin + t * chunk;
+        const std::size_t hi = std::min(end, lo + chunk);
+        if (lo >= hi) continue;
+        workers.emplace_back([lo, hi, &fn]() {
+            for (std::size_t idx = lo; idx < hi; ++idx) fn(idx);
+        });
+    }
+    for (auto& w : workers) w.join();
+}
+
+inline void build_level_schedule(const std::vector<std::size_t>& levels,
+                                 std::vector<std::size_t>&       level_ptr,
+                                 std::vector<std::size_t>&       rows)
+{
+    const std::size_t n = levels.size();
+    std::size_t max_level = 0;
+    for (std::size_t l : levels) max_level = std::max(max_level, l);
+
+    level_ptr.assign(max_level + 2, 0);
+    for (std::size_t l : levels) level_ptr[l + 1]++;
+    for (std::size_t i = 1; i < level_ptr.size(); ++i) {
+        level_ptr[i] += level_ptr[i - 1];
+    }
+    rows.assign(n, 0);
+    auto offsets = level_ptr;
+    for (std::size_t r = 0; r < n; ++r) {
+        rows[offsets[levels[r]]++] = r;
+    }
+}
+
+inline int read_jacobi_sweeps_env(int default_sweeps = 2)
+{
+    if (const char* env = std::getenv("IC0_JACOBI_SWEEPS")) {
+        const int v = std::atoi(env);
+        if (v >= 0 && v <= 10) return v;
+    }
+    return default_sweeps;
+}
+
+} // namespace ic0_detail
+
+// Diagonal-shifted IC0 factorisation. Numeric phase is parallelised over the
+// rows of each forward level (rows within one level are independent of each
+// other; only previously-computed levels are read).
+void ic0_factor(size_t n,
+                const std::vector<size_t>& row_ptr,
+                const std::vector<size_t>& col_idx,
+                const std::vector<double>& vals,
+                IC0Preconditioner& ic0)
+{
+    using ic0_detail::parallel_for_chunks;
+    using ic0_detail::build_level_schedule;
+
+    const size_t not_found = static_cast<size_t>(-1);
+    const double rel_shift = 1e-1;
+    const double abs_shift = 1e-14;
+
+    // Keep a copy of the matrix structure inside the preconditioner so that
+    // host applies (e.g. the MKL CG callback) are self-contained.
+    ic0.row_ptr = row_ptr;
+    ic0.col_idx = col_idx;
+
+    ic0.L_vals.assign(vals.size(), 0.0);
+    ic0.diag.assign(n, 0.0);
+    ic0.diag_pos.assign(n, not_found);
+
+    std::vector<size_t> forward_levels(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        size_t level = 0;
+        for (size_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
+            const size_t col = col_idx[k];
+            if (col == i) {
+                ic0.diag_pos[i] = k;
+                break;
+            }
+            if (col < i) {
+                level = std::max(level, forward_levels[col] + 1);
+            }
+        }
+        if (ic0.diag_pos[i] == not_found) {
+            throw std::runtime_error("No diagonal in row " + std::to_string(i));
+        }
+        if (!(vals[ic0.diag_pos[i]] > 0.0) || !std::isfinite(vals[ic0.diag_pos[i]])) {
+            throw std::runtime_error("IC0 needs positive diagonal at row " + std::to_string(i));
+        }
+        forward_levels[i] = level;
+    }
+    build_level_schedule(forward_levels, ic0.forward_level_ptr, ic0.forward_rows);
+
+    ic0.upper_ptr.assign(n + 1, 0);
+    for (size_t i = 0; i < n; ++i) {
+        for (size_t k = row_ptr[i]; k < ic0.diag_pos[i]; ++k) {
+            ic0.upper_ptr[col_idx[k] + 1]++;
+        }
+    }
+    for (size_t i = 1; i < ic0.upper_ptr.size(); ++i) {
+        ic0.upper_ptr[i] += ic0.upper_ptr[i - 1];
+    }
+
+    ic0.upper_row_idx.assign(ic0.upper_ptr.back(), 0);
+    ic0.upper_pos.assign(ic0.upper_ptr.back(), 0);
+    {
+        auto offsets = ic0.upper_ptr;
+        for (size_t row = 0; row < n; ++row) {
+            for (size_t k = row_ptr[row]; k < ic0.diag_pos[row]; ++k) {
+                const size_t col = col_idx[k];
+                const size_t off = offsets[col]++;
+                ic0.upper_row_idx[off] = row;
+                ic0.upper_pos[off]     = k;
+            }
+        }
+    }
+
+    std::vector<size_t> backward_levels(n, 0);
+    for (size_t i = n; i-- > 0;) {
+        size_t level = 0;
+        for (size_t p = ic0.upper_ptr[i]; p < ic0.upper_ptr[i + 1]; ++p) {
+            level = std::max(level, backward_levels[ic0.upper_row_idx[p]] + 1);
+        }
+        backward_levels[i] = level;
+    }
+    build_level_schedule(backward_levels, ic0.backward_level_ptr, ic0.backward_rows);
+
+    const size_t flcount =
+        ic0.forward_level_ptr.empty() ? 0 : ic0.forward_level_ptr.size() - 1;
+    for (size_t level = 0; level < flcount; ++level) {
+        const size_t lb = ic0.forward_level_ptr[level];
+        const size_t le = ic0.forward_level_ptr[level + 1];
+
+        parallel_for_chunks(lb, le, [&](size_t li) {
+            const size_t i  = ic0.forward_rows[li];
+            const size_t di = ic0.diag_pos[i];
+
+            double row_sum_abs = 0.0;
+            for (size_t k = row_ptr[i]; k < row_ptr[i + 1]; ++k) {
+                row_sum_abs += std::abs(vals[k]);
+            }
+
+            for (size_t idx = row_ptr[i]; idx < di; ++idx) {
+                const size_t j = col_idx[idx];
+                double sum  = vals[idx];
+                size_t pi = row_ptr[i];
+                size_t pj = row_ptr[j];
+
+                while (pi < di && pj < ic0.diag_pos[j]) {
+                    const size_t ci = col_idx[pi];
+                    const size_t cj = col_idx[pj];
+                    if (ci >= j || cj >= j) break;
+                    if (ci == cj) {
+                        sum -= ic0.L_vals[pi] * ic0.diag[ci] * ic0.L_vals[pj];
+                        ++pi;
+                        ++pj;
+                    } else if (ci < cj) {
+                        ++pi;
+                    } else {
+                        ++pj;
+                    }
+                }
+
+                double denom = ic0.diag[j];
+                if (!std::isfinite(denom) || std::abs(denom) < abs_shift) {
+                    denom = std::max(abs_shift,
+                                     rel_shift * std::max(std::abs(vals[ic0.diag_pos[j]]), 1.0));
+                }
+                double lij = sum / denom;
+                if (!std::isfinite(lij)) lij = 0.0;
+                ic0.L_vals[idx] = lij;
+            }
+
+            double diag_value = vals[di];
+            for (size_t idx = row_ptr[i]; idx < di; ++idx) {
+                const size_t j = col_idx[idx];
+                diag_value -= ic0.L_vals[idx] * ic0.L_vals[idx] * ic0.diag[j];
+            }
+            diag_value += rel_shift * row_sum_abs;
+
+            const double diag_floor = std::max({
+                abs_shift,
+                rel_shift * std::max(std::abs(vals[di]), 1.0),
+                rel_shift * std::max(row_sum_abs, 1.0)
+            });
+            if (!std::isfinite(diag_value) || diag_value < diag_floor) {
+                diag_value = diag_floor;
+            }
+            ic0.diag[i]    = diag_value;
+            ic0.L_vals[di] = 1.0;
+        });
+    }
+}
+
+namespace ic0_detail {
+
+// Exact (level-scheduled) apply. Forward+backward triangular solve along
+// the IC0 dependency DAG, using the persistent WorkerPool.
 inline void apply_host_exact(const IC0Preconditioner&   ic0,
                              const std::vector<double>& src,
                              std::vector<double>&       y,
@@ -1453,6 +1162,11 @@ inline void apply_host_exact(const IC0Preconditioner&   ic0,
     }
 }
 
+// Jacobi-sweep apply. Mirrors the GPU implementation: each sweep is one bulk
+// parallel pass over n rows, no per-level dispatch. ns total sweeps per
+// direction (1 init "y_curr = src" + ns-1 real). Approximates L^{-1} well
+// after 2-3 sweeps for diagonally dominant 3D matrices, at a fraction of the
+// dispatch cost on big matrices.
 inline void apply_host_jacobi(const IC0Preconditioner&   ic0,
                               const std::vector<double>& src,
                               std::vector<double>&       y,
@@ -1497,6 +1211,8 @@ inline void apply_host_jacobi(const IC0Preconditioner&   ic0,
         });
     };
 
+    // Pick parity so the LAST forward sweep writes into y (the backward
+    // phase reads y). Same trick as the GPU implementation.
     const bool fwd_last_into_y = (ns % 2 == 1);
     std::vector<double>* fwd_first  = fwd_last_into_y ? &y     : &y_tmp;
     std::vector<double>* fwd_second = fwd_last_into_y ? &y_tmp : &y;
@@ -1507,7 +1223,9 @@ inline void apply_host_jacobi(const IC0Preconditioner&   ic0,
         std::vector<double>* yout = (s % 2 == 1) ? fwd_second : fwd_first;
         fwd_sweep(*yin, *yout, /*init=*/false);
     }
+    // Forward result lives in y.
 
+    // Backward: result must end in dst.
     const bool bwd_starts_in_dst = (ns % 2 == 1);
     std::vector<double>* bwd_first  = bwd_starts_in_dst ? &dst   : &y_tmp;
     std::vector<double>* bwd_second = bwd_starts_in_dst ? &y_tmp : &dst;
@@ -1518,26 +1236,27 @@ inline void apply_host_jacobi(const IC0Preconditioner&   ic0,
         std::vector<double>* xout = (s % 2 == 1) ? bwd_second : bwd_first;
         bwd_sweep(y, *xin, *xout, /*init=*/false);
     }
+    // Backward result in dst.
 }
 
-} // namespace ic0_apply_detail
+} // namespace ic0_detail
 
 void applyIC0_preconditioner_host(const IC0Preconditioner&   ic0,
-                                  const std::vector<double>& b,
+                                  const std::vector<double>& src,
                                   std::vector<double>&       y,
-                                  std::vector<double>&       x)
+                                  std::vector<double>&       dst)
 {
-    const std::size_t n = b.size();
-    if (y.size() != n) y.resize(n);
-    if (x.size() != n) x.resize(n);
+    const std::size_t n = src.size();
+    if (y.size()   != n) y.assign(n, 0.0);
+    if (dst.size() != n) dst.assign(n, 0.0);
 
-    const int ns = ic0_apply_detail::read_jacobi_sweeps_env(2);
+    const int ns = ic0_detail::read_jacobi_sweeps_env(2);
     if (ns <= 0) {
-        ic0_apply_detail::apply_host_exact(ic0, b, y, x);
+        ic0_detail::apply_host_exact(ic0, src, y, dst);
     } else {
         thread_local std::vector<double> y_tmp;
         if (y_tmp.size() != n) y_tmp.assign(n, 0.0);
-        ic0_apply_detail::apply_host_jacobi(ic0, b, y, y_tmp, x, ns);
+        ic0_detail::apply_host_jacobi(ic0, src, y, y_tmp, dst, ns);
     }
 }
 
@@ -1618,7 +1337,7 @@ void applyIC0_preconditioner_jacobi_device(sycl::queue&              q,
         });
     };
 
-    // Forward: parity so the LAST sweep writes into y_buf.
+    // Forward: parity so that the LAST sweep writes into y_buf.
     const bool fwd_last_into_y_buf = (ns % 2 == 1);
     sycl::buffer<double>* fwd_first  = fwd_last_into_y_buf ? &y_buf  : &y2_buf;
     sycl::buffer<double>* fwd_second = fwd_last_into_y_buf ? &y2_buf : &y_buf;
@@ -1644,4 +1363,3 @@ void applyIC0_preconditioner_jacobi_device(sycl::queue&              q,
     }
     // Result now in dst_buf.
 }
-

@@ -20,14 +20,14 @@ struct BenchmarkResult {
     size_t polynomial_degree = 0;
 };
 
+// Diagonal-shifted IC0 factorisation (level-scheduled) — port of the
+// standalone implementation in ic0_sycl/ic0_cg_sycl.cpp.
 struct IC0Preconditioner {
-    std::vector<size_t> row_ptr;
-    std::vector<size_t> col_idx;
-    std::vector<size_t> perm;
-    std::vector<size_t> inv_perm;
+    std::vector<size_t> row_ptr;       // copy of A's row_ptr (kept so the host apply is self-contained)
+    std::vector<size_t> col_idx;       // copy of A's col_ind
+    std::vector<size_t> diag_pos;
     std::vector<double> L_vals;
     std::vector<double> diag;
-    std::vector<size_t> diag_pos;
     std::vector<size_t> forward_level_ptr;
     std::vector<size_t> forward_rows;
     std::vector<size_t> backward_level_ptr;
@@ -213,19 +213,6 @@ BenchmarkResult test_CG_SYCL_block_jacobi(CSR_matrix<double>& mat,
                                           int& number_iter,
                                           size_t block_size = 16);
 
-BenchmarkResult test_CG_SYCL_SPAI(CSR_matrix<double>& mat,
-                                  std::vector<double>& x,
-                                  std::vector<double>& b,
-                                  std::string& device,
-                                  int& number_iter);
-
-BenchmarkResult test_CG_SYCL_chebyshev(CSR_matrix<double>& mat,
-                                       std::vector<double>& x,
-                                       std::vector<double>& b,
-                                       std::string& device,
-                                       int& number_iter,
-                                       size_t degree = 4);
-
 BenchmarkResult test_CG_SYCL_chebyshev_adaptive(CSR_matrix<double>& mat,
                                                 std::vector<double>& x,
                                                 std::vector<double>& b,
@@ -242,11 +229,6 @@ BenchmarkResult test_CG_MKL_plain(CSR_matrix<double>& mat,
                                   std::vector<double>& x,
                                   std::vector<double>& b,
                                   int& number_iter);
-
-BenchmarkResult test_CG_MKL_SPAI(CSR_matrix<double>& mat,
-                                 std::vector<double>& x,
-                                 std::vector<double>& b,
-                                 int& number_iter);
 
 BenchmarkResult test_CG_MKL_block_jacobi(CSR_matrix<double>& mat,
                                          std::vector<double>& x,
@@ -348,57 +330,6 @@ void apply_block_jacobi_preconditioner(sycl::queue& q,
                                        size_t n,
                                        size_t block_size);
 
-void compute_spai_preconditioner_buf(sycl::buffer<size_t>& row_ptr_buf,
-                                    sycl::buffer<size_t>& diag_pos_buf,
-                                    sycl::buffer<double>& val_buf,
-                                    sycl::buffer<double>& M_inv_buf,
-                                    size_t n,
-                                    sycl::queue& q);
-
-// Variant that searches the diagonal position inline (no diag_pos needed).
-void compute_spai_preconditioner_inline_buf(sycl::buffer<size_t>& row_ptr_buf,
-                                            sycl::buffer<size_t>& col_ind_buf,
-                                            sycl::buffer<double>& val_buf,
-                                            sycl::buffer<double>& M_inv_buf,
-                                            size_t n,
-                                            sycl::queue& q);
-
-double estimate_gershgorin_upper_bound(const std::vector<size_t>& row_ptr,
-                                       const std::vector<double>& vals);
-
-double estimate_chebyshev_lambda_min(const std::vector<size_t>& row_ptr,
-                                     const std::vector<size_t>& col_ind,
-                                     const std::vector<double>& vals,
-                                     const std::vector<double>& rhs,
-                                     size_t degree,
-                                     double lambda_max_estimate);
-
-void estimate_gershgorin_upper_bound_device(sycl::queue& q,
-                                            sycl::buffer<size_t>& row_ptr_buf,
-                                            sycl::buffer<double>& val_buf,
-                                            sycl::buffer<double>& row_sums_buf,
-                                            sycl::buffer<double>& lambda_max_buf,
-                                            size_t n);
-
-void estimate_chebyshev_lambda_min_device(sycl::queue& q,
-                                          sycl::buffer<size_t>& row_ptr_buf,
-                                          sycl::buffer<size_t>& col_ind_buf,
-                                          sycl::buffer<double>& val_buf,
-                                          sycl::buffer<double>& rhs_buf,
-                                          sycl::buffer<double>& probe_buf,
-                                          sycl::buffer<double>& Ap_buf,
-                                          sycl::buffer<double>& norm_buf,
-                                          sycl::buffer<double>& rayleigh_buf,
-                                          sycl::buffer<double>& lambda_max_buf,
-                                          sycl::buffer<double>& lambda_min_buf,
-                                          size_t n);
-
-void build_chebyshev_steps_device(sycl::queue& q,
-                                  sycl::buffer<double>& lambda_min_buf,
-                                  sycl::buffer<double>& lambda_max_buf,
-                                  sycl::buffer<double>& steps_buf,
-                                  size_t degree);
-
 void build_chebyshev_steps(double lambda_min_estimate,
                            double lambda_max_estimate,
                            size_t degree,
@@ -437,14 +368,14 @@ void ic0_factor(size_t n,
                 const std::vector<double>& vals,
                 IC0Preconditioner& ic0);
 
-// IC0 application -- writes x = M^{-1} b on the host. y is reused as the
-// forward-pass scratch / Jacobi ping-pong buffer. Uses Jacobi sweeps by
-// default (env IC0_JACOBI_SWEEPS, default 2; 0 selects exact level-
-// scheduled mode).
+// IC0 application on the host — writes dst = M^{-1} src. y is scratch for
+// the forward pass / Jacobi ping-pong. Mode is selected via env var
+// IC0_JACOBI_SWEEPS: 0 -> exact level-scheduled solve, N>=1 -> N Jacobi
+// sweeps in each direction (default 2).
 void applyIC0_preconditioner_host(const IC0Preconditioner& ic0,
-                                  const std::vector<double>& b,
+                                  const std::vector<double>& src,
                                   std::vector<double>& y,
-                                  std::vector<double>& x);
+                                  std::vector<double>& dst);
 
 // SYCL Jacobi-sweep IC0 apply for the GPU. Each sweep is one bulk
 // parallel_for over n rows; ns total sweeps in each direction. y_buf and
@@ -494,18 +425,6 @@ unsigned int CG_SYCL_block_jacobi(CSR_matrix<double>& mat,
                                   sycl::queue& q,
                                   size_t block_size = 16);
 
-unsigned int CG_SYCL_SPAI(CSR_matrix<double>& mat,
-                          std::vector<double>& x,
-                          std::vector<double>& b,
-                          sycl::queue& q);
-
-unsigned int CG_SYCL_chebyshev(CSR_matrix<double>& mat,
-                               std::vector<double>& x,
-                               std::vector<double>& b,
-                               sycl::queue& q,
-                               size_t degree = 4,
-                               size_t* used_degree = nullptr);
-
 unsigned int CG_SYCL_chebyshev_adaptive(CSR_matrix<double>& mat,
                                         std::vector<double>& x,
                                         std::vector<double>& b,
@@ -520,10 +439,6 @@ unsigned int CG_MKL_jacobi(CSR_matrix<double>& mat,
 unsigned int CG_MKL_plain(CSR_matrix<double>& mat,
                           std::vector<double>& x,
                           std::vector<double>& b);
-
-unsigned int CG_MKL_SPAI(CSR_matrix<double>& mat,
-                         std::vector<double>& x,
-                         std::vector<double>& b);
 
 unsigned int CG_MKL_block_jacobi(CSR_matrix<double>& mat,
                                  std::vector<double>& x,

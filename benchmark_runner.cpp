@@ -186,41 +186,6 @@ BenchmarkResult test_CG_SYCL_block_jacobi(CSR_matrix<double>& mat,
     return result;
 }
 
-BenchmarkResult test_CG_SYCL_SPAI(CSR_matrix<double>& mat,
-                                  vector<double>& x,
-                                  vector<double>& b,
-                                  string& device,
-                                  int& number_iter)
-{
-    BenchmarkResult result = run_benchmark("SPAI", device, x, b, number_iter,
-        [&](sycl::queue& q, vector<double>& x_test) {
-            return CG_SYCL_SPAI(mat, x_test, b, q);
-        });
-    result.matrix_rows = mat.take_rows();
-    result.matrix_cols = mat.take_cols();
-    result.matrix_nnz = mat.take_nnz();
-    return result;
-}
-
-BenchmarkResult test_CG_SYCL_chebyshev(CSR_matrix<double>& mat,
-                                       vector<double>& x,
-                                       vector<double>& b,
-                                       string& device,
-                                       int& number_iter,
-                                       size_t degree)
-{
-    size_t used_degree = degree;
-    BenchmarkResult result = run_benchmark("Chebyshev", device, x, b, number_iter,
-        [&](sycl::queue& q, vector<double>& x_test) {
-            return CG_SYCL_chebyshev(mat, x_test, b, q, degree, &used_degree);
-        });
-    result.matrix_rows = mat.take_rows();
-    result.matrix_cols = mat.take_cols();
-    result.matrix_nnz = mat.take_nnz();
-    result.polynomial_degree = used_degree;
-    return result;
-}
-
 BenchmarkResult test_CG_SYCL_chebyshev_adaptive(CSR_matrix<double>& mat,
                                                 vector<double>& x,
                                                 vector<double>& b,
@@ -263,21 +228,6 @@ BenchmarkResult test_CG_MKL_plain(CSR_matrix<double>& mat,
     BenchmarkResult result = run_host_benchmark("CG", "MKL", x, b, number_iter,
         [&](vector<double>& x_test) {
             return CG_MKL_plain(mat, x_test, b);
-        });
-    result.matrix_rows = mat.take_rows();
-    result.matrix_cols = mat.take_cols();
-    result.matrix_nnz = mat.take_nnz();
-    return result;
-}
-
-BenchmarkResult test_CG_MKL_SPAI(CSR_matrix<double>& mat,
-                                 vector<double>& x,
-                                 vector<double>& b,
-                                 int& number_iter)
-{
-    BenchmarkResult result = run_host_benchmark("SPAI", "MKL", x, b, number_iter,
-        [&](vector<double>& x_test) {
-            return CG_MKL_SPAI(mat, x_test, b);
         });
     result.matrix_rows = mat.take_rows();
     result.matrix_cols = mat.take_cols();
